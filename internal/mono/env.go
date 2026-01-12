@@ -10,11 +10,10 @@ import (
 func DeriveNames(path string) (project, workspace string) {
 	parts := strings.Split(path, string(filepath.Separator))
 	for i, part := range parts {
-		if part == ".conductor" && i > 0 {
-			project = parts[i-1]
-		}
-		if part == "workspaces" && i < len(parts)-1 {
-			workspace = parts[i+1]
+		if part == "workspaces" && i < len(parts)-2 {
+			project = parts[i+1]
+			workspace = parts[i+2]
+			return project, workspace
 		}
 	}
 	return project, workspace
