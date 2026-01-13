@@ -40,6 +40,7 @@ Artifact caches are stored in `~/.mono/cache_local/` and namespaced by project. 
 ## Related Documents
 
 - **[sync.md](./sync.md)** - Cache sync design (syncing artifacts after dependency changes)
+- **[seed.md](./seed.md)** - Cache seeding design (populating cache from existing artifacts in project root)
 
 ## Files to Modify
 
@@ -606,6 +607,8 @@ func TestHardlinkTree(t *testing.T) {
 - [ ] `mono sync <path>` syncs current artifacts to cache (see [sync.md](./sync.md))
 - [ ] `mono destroy` syncs before deleting environment
 - [ ] Sync skips if cache entry already exists for current lockfile
+- [ ] Cache seeded from project root if artifacts exist with matching lockfile (see [seed.md](./seed.md))
+- [ ] Seeding uses hardlinks (doesn't move root's artifacts)
 
 ## Edge Cases
 
@@ -619,6 +622,8 @@ func TestHardlinkTree(t *testing.T) {
 | Project path changes | New project ID, old cache orphaned |
 | Build in progress during sync | Error, user must wait for build to finish |
 | Concurrent syncs (same key) | First wins, second skips |
+| Root has artifacts, same lockfile | Seed cache from root, instant restore |
+| Root has artifacts, different lockfile | Skip seeding, normal build |
 
 ## Performance Expectations
 
