@@ -8,7 +8,17 @@ MAIN_BRANCH=${MAIN_BRANCH:-main}
 DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 get_latest_tag() {
-    git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0"
+    git tag -l 'v*' --sort=-v:refname | head -n 1 || echo "v0.0.0"
+}
+
+get_latest_tag_fallback() {
+    local tag
+    tag=$(get_latest_tag)
+    if [[ -z "$tag" ]]; then
+        echo "v0.0.0"
+    else
+        echo "$tag"
+    fi
 }
 
 echo "Checking out to ${MAIN_BRANCH}..."
@@ -25,7 +35,7 @@ if [[ $(git status --porcelain) != "" ]]; then
     exit 1
 fi
 
-current_version=$(get_latest_tag)
+current_version=$(get_latest_tag_fallback)
 current_version_stripped=${current_version#v}
 
 new_version=$("${DIR}/semver" bump patch "${current_version_stripped}")
