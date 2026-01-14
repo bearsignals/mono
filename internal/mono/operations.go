@@ -114,6 +114,7 @@ func Init(path string) error {
 			}
 		}
 
+		projectID := ComputeProjectID(rootPath)
 		for i := range cacheEntries {
 			entry := &cacheEntries[i]
 			if entry.Hit {
@@ -121,9 +122,16 @@ func Init(path string) error {
 				if err := cm.RestoreFromCache(*entry); err != nil {
 					logger.Log("warning: failed to restore cache: %v", err)
 					entry.Hit = false
+				} else {
+					if err := db.RecordCacheEvent("hit", projectID, entry.Name, entry.Key); err != nil {
+						logger.Log("warning: failed to record cache hit: %v", err)
+					}
 				}
 			} else {
 				logger.Log("cache miss for %s (key: %s)", entry.Name, entry.Key)
+				if err := db.RecordCacheEvent("miss", projectID, entry.Name, entry.Key); err != nil {
+					logger.Log("warning: failed to record cache miss: %v", err)
+				}
 			}
 		}
 	}

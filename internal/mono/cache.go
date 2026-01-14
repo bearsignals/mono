@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -539,4 +540,131 @@ func (cm *CacheManager) seedToCache(sourcePath, cachePath string) error {
 	}
 
 	return HardlinkTree(sourcePath, targetInCache)
+}
+
+type CacheSizeEntry struct {
+	ProjectID string
+	Artifact  string
+	CacheKey  string
+	Size      int64
+}
+
+func (cm *CacheManager) GetCacheSizes() ([]CacheSizeEntry, error) {
+	var entries []CacheSizeEntry
+
+	if !dirExists(cm.LocalCacheDir) {
+		return entries, nil
+	}
+
+	projectDirs, err := os.ReadDir(cm.LocalCacheDir)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cache directory: %w", err)
+	}
+
+	for _, projectDir := range projectDirs {
+		if !projectDir.IsDir() {
+			continue
+		}
+		projectID := projectDir.Name()
+		projectPath := filepath.Join(cm.LocalCacheDir, projectID)
+
+		artifactDirs, err := os.ReadDir(projectPath)
+		if err != nil {
+			continue
+		}
+
+		for _, artifactDir := range artifactDirs {
+			if !artifactDir.IsDir() {
+				continue
+			}
+			artifact := artifactDir.Name()
+			artifactPath := filepath.Join(projectPath, artifact)
+
+			keyDirs, err := os.ReadDir(artifactPath)
+			if err != nil {
+				continue
+			}
+
+			for _, keyDir := range keyDirs {
+				if !keyDir.IsDir() {
+					continue
+				}
+				cacheKey := keyDir.Name()
+				keyPath := filepath.Join(artifactPath, cacheKey)
+
+				size, err := cm.calculateDirSize(keyPath)
+				if err != nil {
+					continue
+				}
+
+				entries = append(entries, CacheSizeEntry{
+					ProjectID: projectID,
+					Artifact:  artifact,
+					CacheKey:  cacheKey,
+					Size:      size,
+				})
+			}
+		}
+	}
+
+	return entries, nil
+}
+
+func (cm *CacheManager) calculateDirSize(path string) (int64, error) {
+	var size int64
+	err := filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		size += info.Size()
+		return nil
+	})
+	return size, err
+}
+
+func (cm *CacheManager) RemoveCacheEntry(projectID, artifact, cacheKey string) error {
+	path := filepath.Join(cm.LocalCacheDir, projectID, artifact, cacheKey)
+	if err := os.RemoveAll(path); err != nil {
+		return fmt.Errorf("failed to remove cache entry: %w", err)
+	}
+
+	cm.cleanEmptyParentDirs(filepath.Join(cm.LocalCacheDir, projectID, artifact))
+	cm.cleanEmptyParentDirs(filepath.Join(cm.LocalCacheDir, projectID))
+
+	return nil
+}
+
+func (cm *CacheManager) cleanEmptyParentDirs(path string) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return
+	}
+	if len(entries) == 0 {
+		os.Remove(path)
+	}
+}
+
+func (cm *CacheManager) RemoveAllCache() (int, int64, error) {
+	entries, err := cm.GetCacheSizes()
+	if err != nil {
+		return 0, 0, err
+	}
+
+	var totalSize int64
+	for _, entry := range entries {
+		totalSize += entry.Size
+	}
+
+	if err := os.RemoveAll(cm.LocalCacheDir); err != nil {
+		return 0, 0, fmt.Errorf("failed to remove cache directory: %w", err)
+	}
+
+	return len(entries), totalSize, nil
 }
