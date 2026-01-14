@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bufio"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -126,12 +126,24 @@ func formatProjectName(rootPath string) string {
 	return rootPath
 }
 
+type cacheDisplayEntry struct {
+	entry       mono.CacheSizeEntry
+	projectName string
+	hits        int
+	lastUsed    string
+	label       string
+}
+
 func newCacheCleanCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "clean",
 		Short: "Remove cached artifacts",
-		Long:  "Remove cached build artifacts. Without flags, prompts for confirmation before cleaning all.",
+		Long:  "Interactively select and remove cached build artifacts.",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if _, err := exec.LookPath("fzf"); err != nil {
+				return fmt.Errorf("fzf not found (install with: brew install fzf)")
+			}
+
 			cm, err := mono.NewCacheManager()
 			if err != nil {
 				return err
@@ -158,36 +170,93 @@ func newCacheCleanCmd() *cobra.Command {
 				return nil
 			}
 
-			if !all {
-				var totalSize int64
-				for _, entry := range sizes {
-					totalSize += entry.Size
-				}
-				fmt.Printf("Found %d cache entries (%s).\n", len(sizes), formatSize(totalSize))
-				fmt.Print("Remove all cached artifacts? [y/N]: ")
-
-				reader := bufio.NewReader(os.Stdin)
-				response, err := reader.ReadString('\n')
+			if all {
+				count, totalSize, err := cm.RemoveAllCache()
 				if err != nil {
 					return err
 				}
-				response = strings.TrimSpace(strings.ToLower(response))
-				if response != "y" && response != "yes" {
-					fmt.Println("Aborted.")
-					return nil
+				if err := db.DeleteAllCacheEvents(); err != nil {
+					return fmt.Errorf("failed to clear cache events: %w", err)
 				}
+				fmt.Printf("Removed %d entries (%s)\n", count, formatSize(totalSize))
+				return nil
 			}
 
-			count, totalSize, err := cm.RemoveAllCache()
+			stats, err := db.GetCacheStats()
 			if err != nil {
 				return err
 			}
 
-			if err := db.DeleteAllCacheEvents(); err != nil {
-				return fmt.Errorf("failed to clear cache events: %w", err)
+			rootPaths, err := db.GetAllRootPaths()
+			if err != nil {
+				return err
 			}
 
-			fmt.Printf("Removed %d entries (%s)\n", count, formatSize(totalSize))
+			projectNames := buildProjectNameMap(rootPaths)
+
+			statsMap := make(map[string]mono.CacheEntry)
+			for _, s := range stats {
+				key := s.ProjectID + "/" + s.Artifact + "/" + s.CacheKey
+				statsMap[key] = s
+			}
+
+			var displayEntries []cacheDisplayEntry
+			for _, entry := range sizes {
+				key := entry.ProjectID + "/" + entry.Artifact + "/" + entry.CacheKey
+
+				projectName := entry.ProjectID
+				if len(projectName) > 12 {
+					projectName = projectName[:12]
+				}
+				if name, ok := projectNames[entry.ProjectID]; ok {
+					projectName = name
+				}
+
+				hits := 0
+				lastUsed := "never"
+				if s, ok := statsMap[key]; ok {
+					hits = s.Hits
+					lastUsed = formatTimeAgo(s.LastUsed)
+				}
+
+				label := fmt.Sprintf("%-20s  %8s   %3d hits   %s",
+					projectName+"/"+entry.Artifact,
+					formatSize(entry.Size),
+					hits,
+					lastUsed,
+				)
+
+				displayEntries = append(displayEntries, cacheDisplayEntry{
+					entry:       entry,
+					projectName: projectName,
+					hits:        hits,
+					lastUsed:    lastUsed,
+					label:       label,
+				})
+			}
+
+			selected, err := selectCachesWithFzf(displayEntries)
+			if err != nil {
+				return err
+			}
+
+			if len(selected) == 0 {
+				fmt.Println("No entries selected.")
+				return nil
+			}
+
+			var totalRemoved int64
+			for _, entry := range selected {
+				if err := cm.RemoveCacheEntry(entry.ProjectID, entry.Artifact, entry.CacheKey); err != nil {
+					return fmt.Errorf("failed to remove %s/%s: %w", entry.ProjectID, entry.Artifact, err)
+				}
+				if err := db.DeleteCacheEvents(entry.ProjectID, entry.Artifact, entry.CacheKey); err != nil {
+					return fmt.Errorf("failed to delete cache events: %w", err)
+				}
+				totalRemoved += entry.Size
+			}
+
+			fmt.Printf("Removed %d entries (%s)\n", len(selected), formatSize(totalRemoved))
 			return nil
 		},
 	}
@@ -195,6 +264,52 @@ func newCacheCleanCmd() *cobra.Command {
 	cmd.Flags().Bool("all", false, "Remove all cached entries without prompting")
 
 	return cmd
+}
+
+func selectCachesWithFzf(entries []cacheDisplayEntry) ([]mono.CacheSizeEntry, error) {
+	var lines []string
+	for _, e := range entries {
+		lines = append(lines, e.label)
+	}
+
+	fzf := exec.Command("fzf",
+		"--multi",
+		"--height=~15",
+		"--layout=reverse-list",
+		"--no-info",
+		"--no-separator",
+		"--pointer=>",
+		"--prompt=clean> ",
+	)
+	fzf.Stdin = strings.NewReader(strings.Join(lines, "\n"))
+	fzf.Stderr = os.Stderr
+
+	output, err := fzf.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
+			return nil, nil
+		}
+		return nil, nil
+	}
+
+	selectedLines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(selectedLines) == 0 || (len(selectedLines) == 1 && selectedLines[0] == "") {
+		return nil, nil
+	}
+
+	labelToEntry := make(map[string]mono.CacheSizeEntry)
+	for _, e := range entries {
+		labelToEntry[e.label] = e.entry
+	}
+
+	var selected []mono.CacheSizeEntry
+	for _, line := range selectedLines {
+		if entry, ok := labelToEntry[line]; ok {
+			selected = append(selected, entry)
+		}
+	}
+
+	return selected, nil
 }
 
 func formatSize(bytes int64) string {
