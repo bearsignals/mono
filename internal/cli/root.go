@@ -10,7 +10,7 @@ import (
 
 func resolvePath(args []string) (string, error) {
 	var path string
-	if len(args) > 0 {
+	if len(args) > 0 && args[0] != "" {
 		path = args[0]
 	} else if envPath := os.Getenv("CONDUCTOR_WORKSPACE_PATH"); envPath != "" {
 		path = envPath
