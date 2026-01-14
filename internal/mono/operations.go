@@ -91,6 +91,29 @@ func Init(path string) error {
 			cacheEntries = entries
 		}
 
+		hasMiss := false
+		for _, entry := range cacheEntries {
+			if !entry.Hit {
+				hasMiss = true
+				break
+			}
+		}
+
+		if hasMiss {
+			if err := cm.SeedFromRoot(cfg.Build.Artifacts, rootPath, path); err != nil {
+				logger.Log("warning: failed to seed cache from root: %v", err)
+			} else {
+				logger.Log("attempted to seed cache from project root")
+			}
+
+			entries, err := cm.PrepareArtifactCache(cfg.Build.Artifacts, rootPath, path)
+			if err != nil {
+				logger.Log("warning: failed to re-prepare artifact cache: %v", err)
+			} else {
+				cacheEntries = entries
+			}
+		}
+
 		for i := range cacheEntries {
 			entry := &cacheEntries[i]
 			if entry.Hit {
@@ -262,6 +285,18 @@ func Destroy(path string) error {
 	rootPath := ""
 	if env.RootPath.Valid {
 		rootPath = env.RootPath.String
+	}
+
+	if cfg != nil && rootPath != "" {
+		cfg.ApplyDefaults(path)
+		cm, err := NewCacheManager()
+		if err == nil {
+			if err := cm.Sync(cfg.Build.Artifacts, rootPath, path, SyncOptions{HardlinkBack: false}); err != nil {
+				logger.Log("warning: failed to sync before destroy: %v", err)
+			} else {
+				logger.Log("synced artifacts to cache before destroy")
+			}
+		}
 	}
 
 	if cfg != nil && cfg.Scripts.Destroy != "" {

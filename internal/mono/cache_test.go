@@ -474,3 +474,765 @@ func TestIntegrationCacheHitMiss(t *testing.T) {
 		t.Error("fingerprints should be cleaned after restore")
 	}
 }
+
+func TestSync(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), []byte("lockfile content"), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
+	}
+
+	targetDir := filepath.Join(envPath, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "artifact.txt"), []byte("artifact"), 0644); err != nil {
+		t.Fatalf("failed to write artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+	cachedFile := filepath.Join(cachePath, "target", "artifact.txt")
+
+	if _, err := os.Stat(cachedFile); err != nil {
+		t.Errorf("cached artifact should exist: %v", err)
+	}
+
+	if _, err := os.Stat(filepath.Join(targetDir, "artifact.txt")); err != nil {
+		t.Errorf("local artifact should still exist (hardlinked back): %v", err)
+	}
+
+	srcInfo, _ := os.Stat(cachedFile)
+	dstInfo, _ := os.Stat(filepath.Join(targetDir, "artifact.txt"))
+	srcIno := srcInfo.Sys().(*syscall.Stat_t).Ino
+	dstIno := dstInfo.Sys().(*syscall.Stat_t).Ino
+
+	if srcIno != dstIno {
+		t.Error("cached and local files should share inode (hardlink)")
+	}
+}
+
+func TestSyncAlreadyCached(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), []byte("lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
+	}
+
+	targetDir := filepath.Join(envPath, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "artifact.txt"), []byte("original"), 0644); err != nil {
+		t.Fatalf("failed to write artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+	cachedFile := filepath.Join(cachePath, "target", "artifact.txt")
+
+	cacheInfoBefore, _ := os.Stat(cachedFile)
+	cacheInoBefore := cacheInfoBefore.Sys().(*syscall.Stat_t).Ino
+
+	if err := os.RemoveAll(targetDir); err != nil {
+		t.Fatalf("failed to remove target dir: %v", err)
+	}
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to recreate target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "artifact.txt"), []byte("new content"), 0644); err != nil {
+		t.Fatalf("failed to write new artifact: %v", err)
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err != nil {
+		t.Fatalf("second sync failed: %v", err)
+	}
+
+	cacheInfoAfter, _ := os.Stat(cachedFile)
+	cacheInoAfter := cacheInfoAfter.Sys().(*syscall.Stat_t).Ino
+
+	if cacheInoBefore != cacheInoAfter {
+		t.Error("cache inode should not change when sync skips (already cached)")
+	}
+
+	cachedContent, _ := os.ReadFile(cachedFile)
+	if string(cachedContent) != "original" {
+		t.Errorf("cached content should be original (sync should skip), got: %s", cachedContent)
+	}
+}
+
+func TestSyncBuildInProgress(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), []byte("lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
+	}
+
+	targetDir := filepath.Join(envPath, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+
+	cargoLock := filepath.Join(targetDir, ".cargo-lock")
+	if err := os.WriteFile(cargoLock, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write .cargo-lock: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err == nil {
+		t.Error("sync should fail when build is in progress")
+	}
+}
+
+func TestSyncNoArtifacts(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), []byte("lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err != nil {
+		t.Errorf("sync should succeed (no-op) when artifacts don't exist: %v", err)
+	}
+}
+
+func TestSyncMissingLockfile(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	targetDir := filepath.Join(envPath, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.Sync(artifacts, rootPath, envPath, SyncOptions{HardlinkBack: true})
+	if err != nil {
+		t.Errorf("sync should skip silently when lockfile missing: %v", err)
+	}
+}
+
+func TestIsBuildInProgress(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	targetDir := filepath.Join(testDir, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+
+	cargoArtifact := ArtifactConfig{Name: "cargo"}
+	npmArtifact := ArtifactConfig{Name: "npm"}
+
+	if cm.isBuildInProgress(testDir, cargoArtifact) {
+		t.Error("should not detect build in progress without .cargo-lock")
+	}
+
+	cargoLock := filepath.Join(targetDir, ".cargo-lock")
+	if err := os.WriteFile(cargoLock, []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write .cargo-lock: %v", err)
+	}
+
+	if !cm.isBuildInProgress(testDir, cargoArtifact) {
+		t.Error("should detect cargo build in progress with .cargo-lock")
+	}
+
+	if cm.isBuildInProgress(testDir, npmArtifact) {
+		t.Error("npm should not detect cargo's build lock")
+	}
+}
+
+func TestSeedFromRoot(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	lockfileContent := []byte("lockfile content")
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	rootTarget := filepath.Join(rootPath, "target")
+	if err := os.MkdirAll(rootTarget, 0755); err != nil {
+		t.Fatalf("failed to create root target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "artifact.txt"), []byte("from root"), 0644); err != nil {
+		t.Fatalf("failed to write root artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+	cachedFile := filepath.Join(cachePath, "target", "artifact.txt")
+
+	if _, err := os.Stat(cachedFile); err != nil {
+		t.Errorf("cached artifact should exist after seeding: %v", err)
+	}
+
+	cachedContent, _ := os.ReadFile(cachedFile)
+	if string(cachedContent) != "from root" {
+		t.Errorf("cached content should match root, got: %s", cachedContent)
+	}
+
+	rootInfo, _ := os.Stat(filepath.Join(rootTarget, "artifact.txt"))
+	cacheInfo, _ := os.Stat(cachedFile)
+	rootIno := rootInfo.Sys().(*syscall.Stat_t).Ino
+	cacheIno := cacheInfo.Sys().(*syscall.Stat_t).Ino
+
+	if rootIno != cacheIno {
+		t.Error("root and cache should share inode (hardlink)")
+	}
+}
+
+func TestSeedSkipsSameDirectory(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(testDir, "Cargo.lock"), []byte("lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
+	}
+
+	targetDir := filepath.Join(testDir, "target")
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		t.Fatalf("failed to create target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(targetDir, "artifact.txt"), []byte("content"), 0644); err != nil {
+		t.Fatalf("failed to write artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, testDir, testDir)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], testDir)
+	cachePath := cm.GetArtifactCachePath(testDir, "cargo", key)
+
+	if dirExists(cachePath) {
+		t.Error("cache should not be created when rootPath == envPath")
+	}
+}
+
+func TestSeedSkipsDifferentLockfiles(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), []byte("root lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), []byte("env lockfile"), 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	rootTarget := filepath.Join(rootPath, "target")
+	if err := os.MkdirAll(rootTarget, 0755); err != nil {
+		t.Fatalf("failed to create root target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "artifact.txt"), []byte("from root"), 0644); err != nil {
+		t.Fatalf("failed to write root artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+
+	if dirExists(cachePath) {
+		t.Error("cache should not be created when lockfiles differ")
+	}
+}
+
+func TestSeedSkipsNoRootArtifacts(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	lockfileContent := []byte("lockfile content")
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+
+	if dirExists(cachePath) {
+		t.Error("cache should not be created when root has no artifacts")
+	}
+}
+
+func TestSeedSkipsBuildInProgress(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	lockfileContent := []byte("lockfile content")
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	rootTarget := filepath.Join(rootPath, "target")
+	if err := os.MkdirAll(rootTarget, 0755); err != nil {
+		t.Fatalf("failed to create root target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "artifact.txt"), []byte("from root"), 0644); err != nil {
+		t.Fatalf("failed to write root artifact: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, ".cargo-lock"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write .cargo-lock: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+
+	if dirExists(cachePath) {
+		t.Error("cache should not be created when root build is in progress")
+	}
+}
+
+func TestSeedAlreadyCached(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	lockfileContent := []byte("lockfile content")
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	rootTarget := filepath.Join(rootPath, "target")
+	if err := os.MkdirAll(rootTarget, 0755); err != nil {
+		t.Fatalf("failed to create root target dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "artifact.txt"), []byte("from root"), 0644); err != nil {
+		t.Fatalf("failed to write root artifact: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], envPath)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+	cacheTarget := filepath.Join(cachePath, "target")
+	if err := os.MkdirAll(cacheTarget, 0755); err != nil {
+		t.Fatalf("failed to create cache dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheTarget, "artifact.txt"), []byte("existing cache"), 0644); err != nil {
+		t.Fatalf("failed to write existing cache: %v", err)
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	cachedContent, _ := os.ReadFile(filepath.Join(cacheTarget, "artifact.txt"))
+	if string(cachedContent) != "existing cache" {
+		t.Errorf("existing cache should not be overwritten, got: %s", cachedContent)
+	}
+}
+
+func TestSeedThenRestore(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	envPath := filepath.Join(testDir, "env")
+
+	if err := os.MkdirAll(rootPath, 0755); err != nil {
+		t.Fatalf("failed to create root dir: %v", err)
+	}
+	if err := os.MkdirAll(envPath, 0755); err != nil {
+		t.Fatalf("failed to create env dir: %v", err)
+	}
+
+	lockfileContent := []byte("lockfile content")
+	if err := os.WriteFile(filepath.Join(rootPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write root Cargo.lock: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(envPath, "Cargo.lock"), lockfileContent, 0644); err != nil {
+		t.Fatalf("failed to write env Cargo.lock: %v", err)
+	}
+
+	rootTarget := filepath.Join(rootPath, "target")
+	if err := os.MkdirAll(filepath.Join(rootTarget, "debug", ".fingerprint"), 0755); err != nil {
+		t.Fatalf("failed to create root fingerprint dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "artifact.txt"), []byte("from root"), 0644); err != nil {
+		t.Fatalf("failed to write root artifact: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(rootTarget, "debug", ".fingerprint", "fp.txt"), []byte("fingerprint"), 0644); err != nil {
+		t.Fatalf("failed to write fingerprint: %v", err)
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("SeedFromRoot failed: %v", err)
+	}
+
+	entries, err := cm.PrepareArtifactCache(artifacts, rootPath, envPath)
+	if err != nil {
+		t.Fatalf("PrepareArtifactCache failed: %v", err)
+	}
+
+	if len(entries) != 1 {
+		t.Fatalf("expected 1 entry, got %d", len(entries))
+	}
+
+	if !entries[0].Hit {
+		t.Error("should be cache hit after seeding")
+	}
+
+	err = cm.RestoreFromCache(entries[0])
+	if err != nil {
+		t.Fatalf("RestoreFromCache failed: %v", err)
+	}
+
+	envTarget := filepath.Join(envPath, "target")
+	restoredContent, err := os.ReadFile(filepath.Join(envTarget, "artifact.txt"))
+	if err != nil {
+		t.Fatalf("failed to read restored artifact: %v", err)
+	}
+
+	if string(restoredContent) != "from root" {
+		t.Errorf("restored content should match root, got: %s", restoredContent)
+	}
+
+	fpDir := filepath.Join(envTarget, "debug", ".fingerprint")
+	if _, err := os.Stat(fpDir); !os.IsNotExist(err) {
+		t.Error("fingerprints should be cleaned after restore")
+	}
+}
+
+func TestConcurrentSync(t *testing.T) {
+	cm, err := NewCacheManager()
+	if err != nil {
+		t.Fatalf("failed to create cache manager: %v", err)
+	}
+
+	testDir := t.TempDir()
+	rootPath := filepath.Join(testDir, "root")
+	env1Path := filepath.Join(testDir, "env1")
+	env2Path := filepath.Join(testDir, "env2")
+
+	for _, p := range []string{env1Path, env2Path} {
+		if err := os.MkdirAll(p, 0755); err != nil {
+			t.Fatalf("failed to create env dir: %v", err)
+		}
+
+		if err := os.WriteFile(filepath.Join(p, "Cargo.lock"), []byte("same lockfile"), 0644); err != nil {
+			t.Fatalf("failed to write Cargo.lock: %v", err)
+		}
+
+		targetDir := filepath.Join(p, "target")
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			t.Fatalf("failed to create target dir: %v", err)
+		}
+		if err := os.WriteFile(filepath.Join(targetDir, "artifact.txt"), []byte("content from "+p), 0644); err != nil {
+			t.Fatalf("failed to write artifact: %v", err)
+		}
+	}
+
+	artifacts := []ArtifactConfig{
+		{
+			Name:        "cargo",
+			KeyFiles:    []string{"Cargo.lock"},
+			KeyCommands: []string{"echo v1"},
+			Paths:       []string{"target"},
+		},
+	}
+
+	done := make(chan error, 2)
+
+	go func() {
+		done <- cm.Sync(artifacts, rootPath, env1Path, SyncOptions{HardlinkBack: true})
+	}()
+
+	go func() {
+		done <- cm.Sync(artifacts, rootPath, env2Path, SyncOptions{HardlinkBack: true})
+	}()
+
+	err1 := <-done
+	err2 := <-done
+
+	if err1 != nil && err2 != nil {
+		t.Errorf("at least one sync should succeed: err1=%v, err2=%v", err1, err2)
+	}
+
+	key, _ := cm.ComputeCacheKey(artifacts[0], env1Path)
+	cachePath := cm.GetArtifactCachePath(rootPath, "cargo", key)
+	cachedFile := filepath.Join(cachePath, "target", "artifact.txt")
+
+	if _, err := os.Stat(cachedFile); err != nil {
+		t.Errorf("cache entry should exist: %v", err)
+	}
+}

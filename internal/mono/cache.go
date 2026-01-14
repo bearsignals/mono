@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 type CacheManager struct {
@@ -311,4 +312,231 @@ func (cm *CacheManager) StoreToCache(entry ArtifactCacheEntry) error {
 	}
 
 	return nil
+}
+
+type SyncOptions struct {
+	HardlinkBack bool
+}
+
+func (cm *CacheManager) acquireCacheLock(cachePath string) (*os.File, error) {
+	lockPath := cachePath + ".lock"
+
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0755); err != nil {
+		return nil, err
+	}
+
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, err
+	}
+
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return nil, nil
+	}
+
+	return f, nil
+}
+
+func (cm *CacheManager) releaseCacheLock(f *os.File) {
+	if f != nil {
+		syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		f.Close()
+	}
+}
+
+func (cm *CacheManager) Sync(artifacts []ArtifactConfig, rootPath, envPath string, opts SyncOptions) error {
+	for _, artifact := range artifacts {
+		if err := cm.syncArtifact(artifact, rootPath, envPath, opts); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cm *CacheManager) isBuildInProgress(envPath string, artifact ArtifactConfig) bool {
+	switch artifact.Name {
+	case "cargo":
+		lockFile := filepath.Join(envPath, "target", ".cargo-lock")
+		return fileExists(lockFile)
+	default:
+		return false
+	}
+}
+
+func (cm *CacheManager) syncArtifact(artifact ArtifactConfig, rootPath, envPath string, opts SyncOptions) error {
+	if cm.isBuildInProgress(envPath, artifact) {
+		return fmt.Errorf("build in progress, cannot sync %s", artifact.Name)
+	}
+
+	key, err := cm.ComputeCacheKey(artifact, envPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute cache key for %s: %w", artifact.Name, err)
+	}
+
+	cachePath := cm.GetArtifactCachePath(rootPath, artifact.Name, key)
+
+	if dirExists(cachePath) {
+		return nil
+	}
+
+	for _, p := range artifact.Paths {
+		localPath := filepath.Join(envPath, p)
+
+		if !dirExists(localPath) {
+			continue
+		}
+
+		if err := cm.moveToCache(localPath, cachePath, opts.HardlinkBack); err != nil {
+			return fmt.Errorf("failed to sync %s: %w", artifact.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func (cm *CacheManager) moveToCache(localPath, cachePath string, hardlinkBack bool) error {
+	lock, err := cm.acquireCacheLock(cachePath)
+	if err != nil {
+		return err
+	}
+	if lock == nil {
+		return nil
+	}
+	defer cm.releaseCacheLock(lock)
+
+	targetInCache := filepath.Join(cachePath, filepath.Base(localPath))
+
+	if dirExists(targetInCache) {
+		return nil
+	}
+
+	if err := os.MkdirAll(cachePath, 0755); err != nil {
+		return err
+	}
+
+	if err := os.Rename(localPath, targetInCache); err != nil {
+		if isCrossDevice(err) {
+			return cm.copyToCache(localPath, targetInCache, hardlinkBack)
+		}
+		return err
+	}
+
+	if hardlinkBack {
+		if err := HardlinkTree(targetInCache, localPath); err != nil {
+			recoverErr := os.Rename(targetInCache, localPath)
+			cleanupErr := os.RemoveAll(cachePath)
+			if recoverErr != nil {
+				return fmt.Errorf("failed to hardlink back and recovery failed: %w (recovery error: %v)", err, recoverErr)
+			}
+			if cleanupErr != nil {
+				return fmt.Errorf("failed to hardlink back, recovered but cleanup failed: %w (cleanup error: %v)", err, cleanupErr)
+			}
+			return fmt.Errorf("failed to hardlink back, recovered: %w", err)
+		}
+	}
+
+	return nil
+}
+
+func (cm *CacheManager) copyToCache(localPath, targetInCache string, hardlinkBack bool) error {
+	if err := copyDir(localPath, targetInCache); err != nil {
+		return err
+	}
+
+	if hardlinkBack {
+		return nil
+	}
+
+	return os.RemoveAll(localPath)
+}
+
+func isCrossDevice(err error) bool {
+	return strings.Contains(err.Error(), "cross-device link") ||
+		strings.Contains(err.Error(), "invalid cross-device link")
+}
+
+func copyDir(src, dst string) error {
+	return filepath.Walk(src, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		dstPath := filepath.Join(dst, relPath)
+
+		if info.IsDir() {
+			return os.MkdirAll(dstPath, info.Mode())
+		}
+
+		return copyFile(path, dstPath)
+	})
+}
+
+func (cm *CacheManager) SeedFromRoot(artifacts []ArtifactConfig, rootPath, envPath string) error {
+	for _, artifact := range artifacts {
+		if err := cm.seedArtifactFromRoot(artifact, rootPath, envPath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cm *CacheManager) seedArtifactFromRoot(artifact ArtifactConfig, rootPath, envPath string) error {
+	if rootPath == envPath {
+		return nil
+	}
+
+	envKey, err := cm.ComputeCacheKey(artifact, envPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute cache key for env %s: %w", artifact.Name, err)
+	}
+
+	cachePath := cm.GetArtifactCachePath(rootPath, artifact.Name, envKey)
+	if dirExists(cachePath) {
+		return nil
+	}
+
+	rootKey, err := cm.ComputeCacheKey(artifact, rootPath)
+	if err != nil {
+		return fmt.Errorf("failed to compute cache key for root %s: %w", artifact.Name, err)
+	}
+
+	if envKey != rootKey {
+		return nil
+	}
+
+	if cm.isBuildInProgress(rootPath, artifact) {
+		return nil
+	}
+
+	for _, p := range artifact.Paths {
+		rootArtifact := filepath.Join(rootPath, p)
+		if !dirExists(rootArtifact) {
+			continue
+		}
+
+		if err := cm.seedToCache(rootArtifact, cachePath); err != nil {
+			return fmt.Errorf("failed to seed %s from root: %w", artifact.Name, err)
+		}
+	}
+
+	return nil
+}
+
+func (cm *CacheManager) seedToCache(sourcePath, cachePath string) error {
+	if err := os.MkdirAll(cachePath, 0755); err != nil {
+		return err
+	}
+
+	targetInCache := filepath.Join(cachePath, filepath.Base(sourcePath))
+
+	if dirExists(targetInCache) {
+		return nil
+	}
+
+	return HardlinkTree(sourcePath, targetInCache)
 }
