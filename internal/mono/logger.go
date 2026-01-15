@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -77,4 +79,57 @@ func (w *LogWriter) Write(p []byte) (n int, err error) {
 		}
 	}
 	return len(p), nil
+}
+
+type ProgressLogger struct {
+	logger      *FileLogger
+	operation   string
+	total       int64
+	completed   atomic.Int64
+	lastLogTime time.Time
+	interval    time.Duration
+	mu          sync.Mutex
+}
+
+func NewProgressLogger(logger *FileLogger, operation string, total int64) *ProgressLogger {
+	return &ProgressLogger{
+		logger:      logger,
+		operation:   operation,
+		total:       total,
+		lastLogTime: time.Now(),
+		interval:    5 * time.Second,
+	}
+}
+
+func (p *ProgressLogger) Increment() {
+	p.completed.Add(1)
+	p.maybeLog()
+}
+
+func (p *ProgressLogger) maybeLog() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if time.Since(p.lastLogTime) < p.interval {
+		return
+	}
+
+	p.logProgress()
+	p.lastLogTime = time.Now()
+}
+
+func (p *ProgressLogger) logProgress() {
+	completed := p.completed.Load()
+	if p.total > 0 {
+		pct := float64(completed) / float64(p.total) * 100
+		p.logger.Log("%s: %d/%d files (%.0f%%)", p.operation, completed, p.total, pct)
+	} else {
+		p.logger.Log("%s: %d files", p.operation, completed)
+	}
+}
+
+func (p *ProgressLogger) Done() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.logProgress()
 }

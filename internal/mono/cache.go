@@ -1,6 +1,7 @@
 package mono
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -10,14 +11,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
+
+	"golang.org/x/sync/errgroup"
 )
 
 type CacheManager struct {
 	HomeDir          string
-	GlobalCacheDir   string
 	LocalCacheDir    string
-	SccacheDir       string
 	SccacheAvailable bool
 }
 
@@ -27,14 +30,9 @@ func NewCacheManager() (*CacheManager, error) {
 		return nil, err
 	}
 
-	globalCacheDir := filepath.Join(homeDir, "cache_global")
-	localCacheDir := filepath.Join(homeDir, "cache_local")
-
 	cm := &CacheManager{
-		HomeDir:        homeDir,
-		GlobalCacheDir: globalCacheDir,
-		LocalCacheDir:  localCacheDir,
-		SccacheDir:     filepath.Join(globalCacheDir, "sccache"),
+		HomeDir:       homeDir,
+		LocalCacheDir: filepath.Join(homeDir, "cache_local"),
 	}
 
 	cm.SccacheAvailable = cm.detectSccache()
@@ -143,11 +141,6 @@ func dirExists(path string) bool {
 }
 
 func (cm *CacheManager) EnsureDirectories() error {
-	if cm.SccacheAvailable {
-		if err := os.MkdirAll(cm.SccacheDir, 0755); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -155,10 +148,7 @@ func (cm *CacheManager) EnvVars(cfg BuildConfig) []string {
 	var vars []string
 
 	if cm.shouldEnableSccache(cfg) {
-		vars = append(vars,
-			"RUSTC_WRAPPER=sccache",
-			"SCCACHE_DIR="+cm.SccacheDir,
-		)
+		vars = append(vars, "RUSTC_WRAPPER=sccache")
 	}
 
 	return vars
@@ -206,6 +196,215 @@ func isHardlinkNotSupported(err error) bool {
 		strings.Contains(err.Error(), "operation not supported")
 }
 
+func shouldSkipPath(relPath string, artifactName string) bool {
+	switch artifactName {
+	case "cargo":
+		return shouldSkipCargoPath(relPath)
+	default:
+		return false
+	}
+}
+
+func shouldSkipCargoPath(relPath string) bool {
+	if strings.HasSuffix(relPath, ".o") {
+		return true
+	}
+	if strings.HasSuffix(relPath, ".d") {
+		return true
+	}
+	if strings.Contains(relPath, "/incremental/") || strings.HasPrefix(relPath, "incremental/") {
+		return true
+	}
+	if relPath == ".cargo-lock" {
+		return true
+	}
+	return false
+}
+
+type SeedOptions struct {
+	ArtifactName  string
+	Logger        *FileLogger
+	NumWorkers    int
+	OperationName string
+}
+
+func copyDirectory(src, dst, artifactName string, logger *FileLogger, operation string) error {
+	return SeedDirectory(src, dst, SeedOptions{
+		ArtifactName:  artifactName,
+		Logger:        logger,
+		OperationName: operation,
+	})
+}
+
+func countFiles(src string, artifactName string) (int64, error) {
+	var count int64
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+		if !shouldSkipPath(relPath, artifactName) {
+			count++
+		}
+		return nil
+	})
+	return count, err
+}
+
+type fileEntry struct {
+	srcPath  string
+	dstPath  string
+	relPath  string
+	mode     fs.FileMode
+}
+
+func SeedDirectory(src, dst string, opts SeedOptions) error {
+	numWorkers := opts.NumWorkers
+	if numWorkers <= 0 {
+		numWorkers = 16
+	}
+
+	var totalFiles int64
+	var progress *ProgressLogger
+	if opts.Logger != nil {
+		var err error
+		totalFiles, err = countFiles(src, opts.ArtifactName)
+		if err != nil {
+			return fmt.Errorf("failed to count files: %w", err)
+		}
+		operation := opts.OperationName
+		if operation == "" {
+			operation = "seeding"
+		}
+		progress = NewProgressLogger(opts.Logger, operation+" "+opts.ArtifactName, totalFiles)
+	}
+
+	var dirs []struct {
+		path string
+		mode fs.FileMode
+	}
+	var files []fileEntry
+
+	err := filepath.WalkDir(src, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, err := filepath.Rel(src, path)
+		if err != nil {
+			return err
+		}
+
+		if d.IsDir() {
+			if shouldSkipPath(relPath+"/", opts.ArtifactName) {
+				return filepath.SkipDir
+			}
+			info, err := d.Info()
+			if err != nil {
+				return err
+			}
+			dirs = append(dirs, struct {
+				path string
+				mode fs.FileMode
+			}{filepath.Join(dst, relPath), info.Mode()})
+			return nil
+		}
+
+		if shouldSkipPath(relPath, opts.ArtifactName) {
+			return nil
+		}
+
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+
+		files = append(files, fileEntry{
+			srcPath:  path,
+			dstPath:  filepath.Join(dst, relPath),
+			relPath:  relPath,
+			mode:     info.Mode(),
+		})
+
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("failed to walk source directory: %w", err)
+	}
+
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir.path, dir.mode); err != nil {
+			return fmt.Errorf("failed to create directory %s: %w", dir.path, err)
+		}
+	}
+
+	fileChan := make(chan fileEntry, len(files))
+	for _, f := range files {
+		fileChan <- f
+	}
+	close(fileChan)
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	var once sync.Once
+	var firstErr error
+
+	for i := 0; i < numWorkers; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case f, ok := <-fileChan:
+					if !ok {
+						return nil
+					}
+
+					if err := linkOrCopyFile(f.srcPath, f.dstPath); err != nil {
+						once.Do(func() {
+							firstErr = fmt.Errorf("failed to link %s: %w", f.relPath, err)
+						})
+						return firstErr
+					}
+
+					if progress != nil {
+						progress.Increment()
+					}
+				}
+			}
+		})
+	}
+
+	if err := g.Wait(); err != nil {
+		return err
+	}
+
+	if progress != nil {
+		progress.Done()
+	}
+
+	return nil
+}
+
+func linkOrCopyFile(src, dst string) error {
+	if err := os.Link(src, dst); err != nil {
+		if os.IsExist(err) {
+			return nil
+		}
+		if isHardlinkNotSupported(err) {
+			return copyFile(src, dst)
+		}
+		return err
+	}
+	return nil
+}
+
 func copyFile(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -230,7 +429,7 @@ func copyFile(src, dst string) error {
 	return os.Chmod(dst, info.Mode())
 }
 
-func (cm *CacheManager) RestoreFromCache(entry ArtifactCacheEntry) error {
+func (cm *CacheManager) RestoreFromCache(entry ArtifactCacheEntry, logger *FileLogger) error {
 	for _, envPath := range entry.EnvPaths {
 		srcPath := filepath.Join(entry.CachePath, filepath.Base(envPath))
 		if !dirExists(srcPath) {
@@ -241,7 +440,7 @@ func (cm *CacheManager) RestoreFromCache(entry ArtifactCacheEntry) error {
 			return fmt.Errorf("failed to remove existing %s: %w", envPath, err)
 		}
 
-		if err := HardlinkTree(srcPath, envPath); err != nil {
+		if err := copyDirectory(srcPath, envPath, entry.Name, logger, "restoring"); err != nil {
 			return fmt.Errorf("failed to restore cache for %s: %w", entry.Name, err)
 		}
 
@@ -255,30 +454,129 @@ func (cm *CacheManager) RestoreFromCache(entry ArtifactCacheEntry) error {
 func (cm *CacheManager) ApplyPostRestoreFixes(artifactName, envPath string) error {
 	switch artifactName {
 	case "cargo":
-		return cm.cleanCargoFingerprints(envPath)
-	case "npm", "yarn", "pnpm":
+		return cm.touchCargoFingerprints(envPath)
+	case "npm", "yarn", "pnpm", "bun":
 		return cm.cleanNodeModulesBin(envPath)
 	default:
 		return nil
 	}
 }
 
-func (cm *CacheManager) cleanCargoFingerprints(targetDir string) error {
-	fingerprintDirs := []string{
-		filepath.Join(targetDir, "debug", ".fingerprint"),
-		filepath.Join(targetDir, "release", ".fingerprint"),
-		filepath.Join(targetDir, ".fingerprint"),
+func (cm *CacheManager) touchCargoFingerprints(targetDir string) error {
+	now := time.Now()
+
+	for _, profile := range []string{"debug", "release"} {
+		fingerprintDir := filepath.Join(targetDir, profile, ".fingerprint")
+		if !dirExists(fingerprintDir) {
+			continue
+		}
+
+		if err := touchDepFilesParallel(fingerprintDir, now, 8); err != nil {
+			return err
+		}
 	}
 
-	for _, dir := range fingerprintDirs {
-		if dirExists(dir) {
-			if err := os.RemoveAll(dir); err != nil {
-				return fmt.Errorf("failed to clean fingerprints at %s: %w", dir, err)
+	return nil
+}
+
+func touchDepFiles(fingerprintDir string, now time.Time) error {
+	crateEntries, err := os.ReadDir(fingerprintDir)
+	if err != nil {
+		return err
+	}
+
+	for _, crateEntry := range crateEntries {
+		if !crateEntry.IsDir() {
+			continue
+		}
+
+		crateDir := filepath.Join(fingerprintDir, crateEntry.Name())
+		fileEntries, err := os.ReadDir(crateDir)
+		if err != nil {
+			continue
+		}
+
+		for _, fileEntry := range fileEntries {
+			if fileEntry.IsDir() {
+				continue
+			}
+			if !strings.HasPrefix(fileEntry.Name(), "dep-") {
+				continue
+			}
+			filePath := filepath.Join(crateDir, fileEntry.Name())
+			if err := os.Chtimes(filePath, now, now); err != nil {
+				return err
 			}
 		}
 	}
 
 	return nil
+}
+
+func touchDepFilesParallel(fingerprintDir string, now time.Time, numWorkers int) error {
+	crateEntries, err := os.ReadDir(fingerprintDir)
+	if err != nil {
+		return err
+	}
+
+	if numWorkers <= 0 {
+		numWorkers = 8
+	}
+
+	var depFiles []string
+	for _, crateEntry := range crateEntries {
+		if !crateEntry.IsDir() {
+			continue
+		}
+
+		crateDir := filepath.Join(fingerprintDir, crateEntry.Name())
+		fileEntries, err := os.ReadDir(crateDir)
+		if err != nil {
+			continue
+		}
+
+		for _, fileEntry := range fileEntries {
+			if fileEntry.IsDir() {
+				continue
+			}
+			if !strings.HasPrefix(fileEntry.Name(), "dep-") {
+				continue
+			}
+			depFiles = append(depFiles, filepath.Join(crateDir, fileEntry.Name()))
+		}
+	}
+
+	if len(depFiles) == 0 {
+		return nil
+	}
+
+	fileChan := make(chan string, len(depFiles))
+	for _, f := range depFiles {
+		fileChan <- f
+	}
+	close(fileChan)
+
+	g, ctx := errgroup.WithContext(context.Background())
+
+	for i := 0; i < numWorkers; i++ {
+		g.Go(func() error {
+			for {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case path, ok := <-fileChan:
+					if !ok {
+						return nil
+					}
+					if err := os.Chtimes(path, now, now); err != nil {
+						return err
+					}
+				}
+			}
+		})
+	}
+
+	return g.Wait()
 }
 
 func (cm *CacheManager) cleanNodeModulesBin(nodeModulesDir string) error {
@@ -477,16 +775,16 @@ func copyDir(src, dst string) error {
 	})
 }
 
-func (cm *CacheManager) SeedFromRoot(artifacts []ArtifactConfig, rootPath, envPath string) error {
+func (cm *CacheManager) SeedFromRoot(artifacts []ArtifactConfig, rootPath, envPath string, logger *FileLogger) error {
 	for _, artifact := range artifacts {
-		if err := cm.seedArtifactFromRoot(artifact, rootPath, envPath); err != nil {
+		if err := cm.seedArtifactFromRoot(artifact, rootPath, envPath, logger); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (cm *CacheManager) seedArtifactFromRoot(artifact ArtifactConfig, rootPath, envPath string) error {
+func (cm *CacheManager) seedArtifactFromRoot(artifact ArtifactConfig, rootPath, envPath string, logger *FileLogger) error {
 	if rootPath == envPath {
 		return nil
 	}
@@ -520,7 +818,7 @@ func (cm *CacheManager) seedArtifactFromRoot(artifact ArtifactConfig, rootPath, 
 			continue
 		}
 
-		if err := cm.seedToCache(rootArtifact, cachePath); err != nil {
+		if err := cm.seedToCache(rootArtifact, cachePath, artifact.Name, logger); err != nil {
 			return fmt.Errorf("failed to seed %s from root: %w", artifact.Name, err)
 		}
 	}
@@ -528,7 +826,7 @@ func (cm *CacheManager) seedArtifactFromRoot(artifact ArtifactConfig, rootPath, 
 	return nil
 }
 
-func (cm *CacheManager) seedToCache(sourcePath, cachePath string) error {
+func (cm *CacheManager) seedToCache(sourcePath, cachePath, artifactName string, logger *FileLogger) error {
 	if err := os.MkdirAll(cachePath, 0755); err != nil {
 		return err
 	}
@@ -539,7 +837,10 @@ func (cm *CacheManager) seedToCache(sourcePath, cachePath string) error {
 		return nil
 	}
 
-	return HardlinkTree(sourcePath, targetInCache)
+	return SeedDirectory(sourcePath, targetInCache, SeedOptions{
+		ArtifactName: artifactName,
+		Logger:       logger,
+	})
 }
 
 type CacheSizeEntry struct {

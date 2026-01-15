@@ -1,11 +1,13 @@
 package mono
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"syscall"
 	"testing"
+	"time"
 )
 
 func TestComputeProjectID(t *testing.T) {
@@ -242,7 +244,7 @@ func TestStoreAndRestoreCache(t *testing.T) {
 	}
 
 	entry.Hit = true
-	if err := cm.RestoreFromCache(entry); err != nil {
+	if err := cm.RestoreFromCache(entry, nil); err != nil {
 		t.Fatalf("RestoreFromCache failed: %v", err)
 	}
 
@@ -286,36 +288,102 @@ func TestDetectArtifacts(t *testing.T) {
 	}
 }
 
-func TestCleanCargoFingerprints(t *testing.T) {
-	cm, err := NewCacheManager()
-	if err != nil {
-		t.Fatalf("failed to create cache manager: %v", err)
+func TestDetectNestedArtifacts(t *testing.T) {
+	testDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(testDir, "web"), 0755); err != nil {
+		t.Fatalf("failed to create web dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "web", "package-lock.json"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write web/package-lock.json: %v", err)
 	}
 
-	targetDir := t.TempDir()
-	debugFp := filepath.Join(targetDir, "debug", ".fingerprint")
-	releaseFp := filepath.Join(targetDir, "release", ".fingerprint")
-
-	if err := os.MkdirAll(debugFp, 0755); err != nil {
-		t.Fatalf("failed to create debug fingerprint dir: %v", err)
-	}
-	if err := os.MkdirAll(releaseFp, 0755); err != nil {
-		t.Fatalf("failed to create release fingerprint dir: %v", err)
+	artifacts := detectArtifacts(testDir)
+	if len(artifacts) != 1 {
+		t.Fatalf("should detect 1 artifact, got %d", len(artifacts))
 	}
 
-	if err := os.WriteFile(filepath.Join(debugFp, "test"), []byte("fp"), 0644); err != nil {
-		t.Fatalf("failed to write fingerprint file: %v", err)
+	a := artifacts[0]
+	if a.Name != "npm-web" {
+		t.Errorf("expected name 'npm-web', got %s", a.Name)
+	}
+	if len(a.KeyFiles) != 1 || a.KeyFiles[0] != "web/package-lock.json" {
+		t.Errorf("expected key_files ['web/package-lock.json'], got %v", a.KeyFiles)
+	}
+	if len(a.Paths) != 1 || a.Paths[0] != "web/node_modules" {
+		t.Errorf("expected paths ['web/node_modules'], got %v", a.Paths)
+	}
+}
+
+func TestDetectMixedArtifacts(t *testing.T) {
+	testDir := t.TempDir()
+
+	if err := os.WriteFile(filepath.Join(testDir, "Cargo.lock"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write Cargo.lock: %v", err)
 	}
 
-	if err := cm.cleanCargoFingerprints(targetDir); err != nil {
-		t.Fatalf("cleanCargoFingerprints failed: %v", err)
+	if err := os.MkdirAll(filepath.Join(testDir, "web"), 0755); err != nil {
+		t.Fatalf("failed to create web dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "web", "package-lock.json"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write web/package-lock.json: %v", err)
 	}
 
-	if _, err := os.Stat(debugFp); !os.IsNotExist(err) {
-		t.Error("debug .fingerprint should be removed")
+	artifacts := detectArtifacts(testDir)
+	if len(artifacts) != 2 {
+		t.Fatalf("should detect 2 artifacts, got %d", len(artifacts))
 	}
-	if _, err := os.Stat(releaseFp); !os.IsNotExist(err) {
-		t.Error("release .fingerprint should be removed")
+
+	names := make(map[string]bool)
+	for _, a := range artifacts {
+		names[a.Name] = true
+	}
+
+	if !names["cargo"] {
+		t.Error("should detect cargo artifact")
+	}
+	if !names["npm-web"] {
+		t.Error("should detect npm-web artifact")
+	}
+}
+
+func TestDetectSkipsNodeModules(t *testing.T) {
+	testDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(testDir, "node_modules", "some-pkg"), 0755); err != nil {
+		t.Fatalf("failed to create node_modules dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "node_modules", "some-pkg", "package-lock.json"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write package-lock.json in node_modules: %v", err)
+	}
+
+	artifacts := detectArtifacts(testDir)
+	if len(artifacts) != 0 {
+		t.Errorf("should not detect artifacts inside node_modules, got %d", len(artifacts))
+	}
+}
+
+func TestDetectDeeplyNestedArtifacts(t *testing.T) {
+	testDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(testDir, "packages", "frontend"), 0755); err != nil {
+		t.Fatalf("failed to create packages/frontend dir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(testDir, "packages", "frontend", "yarn.lock"), []byte(""), 0644); err != nil {
+		t.Fatalf("failed to write yarn.lock: %v", err)
+	}
+
+	artifacts := detectArtifacts(testDir)
+	if len(artifacts) != 1 {
+		t.Fatalf("should detect 1 artifact, got %d", len(artifacts))
+	}
+
+	a := artifacts[0]
+	if a.Name != "yarn-packages-frontend" {
+		t.Errorf("expected name 'yarn-packages-frontend', got %s", a.Name)
+	}
+	if a.Paths[0] != filepath.Join("packages", "frontend", "node_modules") {
+		t.Errorf("expected path 'packages/frontend/node_modules', got %s", a.Paths[0])
 	}
 }
 
@@ -461,7 +529,7 @@ func TestIntegrationCacheHitMiss(t *testing.T) {
 		t.Fatalf("failed to remove target: %v", err)
 	}
 
-	if err := cm.RestoreFromCache(entries2[0]); err != nil {
+	if err := cm.RestoreFromCache(entries2[0], nil); err != nil {
 		t.Fatalf("RestoreFromCache failed: %v", err)
 	}
 
@@ -470,8 +538,8 @@ func TestIntegrationCacheHitMiss(t *testing.T) {
 	}
 
 	fpDir := filepath.Join(targetDir, "debug", ".fingerprint")
-	if _, err := os.Stat(fpDir); !os.IsNotExist(err) {
-		t.Error("fingerprints should be cleaned after restore")
+	if _, err := os.Stat(fpDir); err != nil {
+		t.Error("fingerprints should be preserved after restore")
 	}
 }
 
@@ -797,7 +865,7 @@ func TestSeedFromRoot(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -854,7 +922,7 @@ func TestSeedSkipsSameDirectory(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, testDir, testDir)
+	err = cm.SeedFromRoot(artifacts, testDir, testDir, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -908,7 +976,7 @@ func TestSeedSkipsDifferentLockfiles(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -955,7 +1023,7 @@ func TestSeedSkipsNoRootArtifacts(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -1013,7 +1081,7 @@ func TestSeedSkipsBuildInProgress(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -1078,7 +1146,7 @@ func TestSeedAlreadyCached(t *testing.T) {
 		t.Fatalf("failed to write existing cache: %v", err)
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -1134,7 +1202,7 @@ func TestSeedThenRestore(t *testing.T) {
 		},
 	}
 
-	err = cm.SeedFromRoot(artifacts, rootPath, envPath)
+	err = cm.SeedFromRoot(artifacts, rootPath, envPath, nil)
 	if err != nil {
 		t.Fatalf("SeedFromRoot failed: %v", err)
 	}
@@ -1152,7 +1220,7 @@ func TestSeedThenRestore(t *testing.T) {
 		t.Error("should be cache hit after seeding")
 	}
 
-	err = cm.RestoreFromCache(entries[0])
+	err = cm.RestoreFromCache(entries[0], nil)
 	if err != nil {
 		t.Fatalf("RestoreFromCache failed: %v", err)
 	}
@@ -1168,8 +1236,8 @@ func TestSeedThenRestore(t *testing.T) {
 	}
 
 	fpDir := filepath.Join(envTarget, "debug", ".fingerprint")
-	if _, err := os.Stat(fpDir); !os.IsNotExist(err) {
-		t.Error("fingerprints should be cleaned after restore")
+	if _, err := os.Stat(fpDir); err != nil {
+		t.Error("fingerprints should be preserved after restore")
 	}
 }
 
@@ -1234,5 +1302,265 @@ func TestConcurrentSync(t *testing.T) {
 
 	if _, err := os.Stat(cachedFile); err != nil {
 		t.Errorf("cache entry should exist: %v", err)
+	}
+}
+
+func TestShouldSkipCargoPath(t *testing.T) {
+	tests := []struct {
+		path     string
+		expected bool
+	}{
+		{"foo.o", true},
+		{"debug/deps/foo.o", true},
+		{"foo.d", true},
+		{"debug/deps/foo.d", true},
+		{"incremental/foo/bar.bin", true},
+		{"debug/incremental/foo/bar", true},
+		{".cargo-lock", true},
+		{"foo.rlib", false},
+		{"foo.rmeta", false},
+		{"build/foo/output", false},
+		{"debug/deps/libfoo.rlib", false},
+		{"release/deps/libfoo.a", false},
+		{"deps/foo.dylib", false},
+	}
+
+	for _, tt := range tests {
+		result := shouldSkipCargoPath(tt.path)
+		if result != tt.expected {
+			t.Errorf("shouldSkipCargoPath(%q) = %v, want %v", tt.path, result, tt.expected)
+		}
+	}
+}
+
+func TestShouldSkipPath(t *testing.T) {
+	tests := []struct {
+		path         string
+		artifactName string
+		expected     bool
+	}{
+		{"foo.o", "cargo", true},
+		{"foo.d", "cargo", true},
+		{"incremental/foo", "cargo", true},
+		{"foo.rlib", "cargo", false},
+		{"foo.o", "npm", false},
+		{"foo.d", "npm", false},
+		{"node_modules/foo", "npm", false},
+		{"foo.o", "", false},
+	}
+
+	for _, tt := range tests {
+		result := shouldSkipPath(tt.path, tt.artifactName)
+		if result != tt.expected {
+			t.Errorf("shouldSkipPath(%q, %q) = %v, want %v", tt.path, tt.artifactName, result, tt.expected)
+		}
+	}
+}
+
+func TestSeedDirectorySkipsCargoFiles(t *testing.T) {
+	testDir := t.TempDir()
+	srcDir := filepath.Join(testDir, "src")
+	dstDir := filepath.Join(testDir, "dst")
+
+	if err := os.MkdirAll(filepath.Join(srcDir, "debug", "deps"), 0755); err != nil {
+		t.Fatalf("failed to create source dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(srcDir, "debug", "incremental", "foo"), 0755); err != nil {
+		t.Fatalf("failed to create incremental dir: %v", err)
+	}
+
+	files := map[string]string{
+		"debug/deps/libfoo.rlib":          "rlib content",
+		"debug/deps/libfoo.rmeta":         "rmeta content",
+		"debug/deps/foo.o":                "object file",
+		"debug/deps/foo.d":                "dep file",
+		"debug/incremental/foo/cache.bin": "incremental cache",
+		".cargo-lock":                     "lock",
+	}
+
+	for path, content := range files {
+		fullPath := filepath.Join(srcDir, path)
+		if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
+			t.Fatalf("failed to create dir for %s: %v", path, err)
+		}
+		if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
+			t.Fatalf("failed to write %s: %v", path, err)
+		}
+	}
+
+	err := SeedDirectory(srcDir, dstDir, SeedOptions{
+		ArtifactName: "cargo",
+	})
+	if err != nil {
+		t.Fatalf("SeedDirectory failed: %v", err)
+	}
+
+	shouldExist := []string{
+		"debug/deps/libfoo.rlib",
+		"debug/deps/libfoo.rmeta",
+	}
+	shouldNotExist := []string{
+		"debug/deps/foo.o",
+		"debug/deps/foo.d",
+		"debug/incremental/foo/cache.bin",
+		".cargo-lock",
+	}
+
+	for _, path := range shouldExist {
+		fullPath := filepath.Join(dstDir, path)
+		if _, err := os.Stat(fullPath); err != nil {
+			t.Errorf("expected %s to exist in destination: %v", path, err)
+		}
+	}
+
+	for _, path := range shouldNotExist {
+		fullPath := filepath.Join(dstDir, path)
+		if _, err := os.Stat(fullPath); !os.IsNotExist(err) {
+			t.Errorf("expected %s to NOT exist in destination", path)
+		}
+	}
+}
+
+func TestSeedDirectoryNoSkipForOtherArtifacts(t *testing.T) {
+	testDir := t.TempDir()
+	srcDir := filepath.Join(testDir, "src")
+	dstDir := filepath.Join(testDir, "dst")
+
+	if err := os.MkdirAll(srcDir, 0755); err != nil {
+		t.Fatalf("failed to create source dir: %v", err)
+	}
+
+	files := []string{"foo.o", "bar.d", "baz.rlib"}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(srcDir, f), []byte("content"), 0644); err != nil {
+			t.Fatalf("failed to write %s: %v", f, err)
+		}
+	}
+
+	err := SeedDirectory(srcDir, dstDir, SeedOptions{
+		ArtifactName: "npm",
+	})
+	if err != nil {
+		t.Fatalf("SeedDirectory failed: %v", err)
+	}
+
+	for _, f := range files {
+		fullPath := filepath.Join(dstDir, f)
+		if _, err := os.Stat(fullPath); err != nil {
+			t.Errorf("expected %s to exist in destination: %v", f, err)
+		}
+	}
+}
+
+func TestCountFiles(t *testing.T) {
+	testDir := t.TempDir()
+
+	if err := os.MkdirAll(filepath.Join(testDir, "debug", "deps"), 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(testDir, "debug", "incremental"), 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+
+	files := []string{
+		"debug/deps/libfoo.rlib",
+		"debug/deps/libfoo.rmeta",
+		"debug/deps/foo.o",
+		"debug/deps/foo.d",
+		"debug/incremental/cache.bin",
+	}
+	for _, f := range files {
+		if err := os.WriteFile(filepath.Join(testDir, f), []byte("content"), 0644); err != nil {
+			t.Fatalf("failed to write %s: %v", f, err)
+		}
+	}
+
+	count, err := countFiles(testDir, "cargo")
+	if err != nil {
+		t.Fatalf("countFiles failed: %v", err)
+	}
+
+	if count != 2 {
+		t.Errorf("expected 2 files (rlib, rmeta), got %d", count)
+	}
+
+	countAll, err := countFiles(testDir, "")
+	if err != nil {
+		t.Fatalf("countFiles failed: %v", err)
+	}
+
+	if countAll != 5 {
+		t.Errorf("expected 5 files with no skip, got %d", countAll)
+	}
+}
+
+func setupMockFingerprints(b *testing.B, numCrates int) string {
+	b.Helper()
+	dir := b.TempDir()
+	fpDir := filepath.Join(dir, "debug", ".fingerprint")
+
+	for i := 0; i < numCrates; i++ {
+		crateDir := filepath.Join(fpDir, fmt.Sprintf("crate-%d-abc123", i))
+		if err := os.MkdirAll(crateDir, 0755); err != nil {
+			b.Fatalf("failed to create crate dir: %v", err)
+		}
+		files := []string{
+			"dep-lib-crate",
+			"invoked.timestamp",
+			"lib-crate.json",
+			"abc123def456",
+		}
+		for _, f := range files {
+			if err := os.WriteFile(filepath.Join(crateDir, f), []byte("content"), 0644); err != nil {
+				b.Fatalf("failed to write file: %v", err)
+			}
+		}
+	}
+
+	return dir
+}
+
+func touchDepFilesFind(fingerprintDir string) error {
+	cmd := exec.Command("find", fingerprintDir, "-type", "f", "-name", "dep-*", "-exec", "touch", "{}", "+")
+	return cmd.Run()
+}
+
+func BenchmarkTouchDepFiles(b *testing.B) {
+	for _, numCrates := range []int{100, 500} {
+		b.Run(fmt.Sprintf("sequential/crates=%d", numCrates), func(b *testing.B) {
+			targetDir := setupMockFingerprints(b, numCrates)
+			fpDir := filepath.Join(targetDir, "debug", ".fingerprint")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := touchDepFiles(fpDir, time.Now()); err != nil {
+					b.Fatalf("touchDepFiles failed: %v", err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("parallel/crates=%d", numCrates), func(b *testing.B) {
+			targetDir := setupMockFingerprints(b, numCrates)
+			fpDir := filepath.Join(targetDir, "debug", ".fingerprint")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := touchDepFilesParallel(fpDir, time.Now(), 8); err != nil {
+					b.Fatalf("touchDepFilesParallel failed: %v", err)
+				}
+			}
+		})
+
+		b.Run(fmt.Sprintf("find/crates=%d", numCrates), func(b *testing.B) {
+			targetDir := setupMockFingerprints(b, numCrates)
+			fpDir := filepath.Join(targetDir, "debug", ".fingerprint")
+
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if err := touchDepFilesFind(fpDir); err != nil {
+					b.Fatalf("touchDepFilesFind failed: %v", err)
+				}
+			}
+		})
 	}
 }

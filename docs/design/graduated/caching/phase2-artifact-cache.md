@@ -19,13 +19,11 @@ This document covers the **core** artifact cache implementation. The following a
 
 ## Design Decision: Project-Namespaced Cache in `~/.mono/cache_local/`
 
-Artifact caches are stored in `~/.mono/cache_local/` and namespaced by project. Unlike sccache in `cache_global/` (which is globally shareable), `target/` and `node_modules/` contents depend on project structure.
+Artifact caches are stored in `~/.mono/cache_local/` and namespaced by project. Unlike sccache (which is globally shareable and uses its own default location), `target/` and `node_modules/` contents depend on project structure.
 
 ```
 ~/.mono/
-├── cache_global/
-│   └── sccache/            # Phase 1: compilation cache
-└── cache_local/            # Phase 2: per-project artifact cache
+└── cache_local/            # per-project artifact cache
     └── <project-id>/
         ├── cargo/
         │   └── <lockfile-hash>/
@@ -139,9 +137,7 @@ import (
 
 type CacheManager struct {
     HomeDir          string
-    GlobalCacheDir   string
     LocalCacheDir    string
-    SccacheDir       string
     SccacheAvailable bool
 }
 
@@ -151,14 +147,9 @@ func NewCacheManager() (*CacheManager, error) {
         return nil, err
     }
 
-    globalCacheDir := filepath.Join(homeDir, "cache_global")
-    localCacheDir := filepath.Join(homeDir, "cache_local")
-
     cm := &CacheManager{
-        HomeDir:        homeDir,
-        GlobalCacheDir: globalCacheDir,
-        LocalCacheDir:  localCacheDir,
-        SccacheDir:     filepath.Join(globalCacheDir, "sccache"),
+        HomeDir:       homeDir,
+        LocalCacheDir: filepath.Join(homeDir, "cache_local"),
     }
 
     cm.SccacheAvailable = cm.detectSccache()
@@ -502,9 +493,7 @@ func Init(path string) error {
 ├── state.db
 ├── mono.log
 ├── data/
-├── cache_global/
-│   └── sccache/            # Phase 1: compilation cache
-└── cache_local/            # Phase 2: per-project artifact cache
+└── cache_local/            # per-project artifact cache
     └── a1b2c3d4e5f6/       # project ID (hash of /Users/x/myproject)
         ├── cargo/
         │   └── 7g8h9i0j/
@@ -512,6 +501,10 @@ func Init(path string) error {
         └── npm/
             └── k1l2m3n4/
                 └── node_modules/
+
+# sccache uses its default location:
+# macOS: ~/Library/Caches/Mozilla.sccache
+# Linux: ~/.cache/sccache
 
 /Users/x/myproject/
 └── environments/

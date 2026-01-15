@@ -24,102 +24,75 @@ Most environments share the same dependencies (same `Cargo.lock` / `package-lock
 - Remote/distributed caching
 - Caching source code (handled by git worktrees)
 
-## Design Overview: Layered Caching
+## Design Overview: Two-Layer Caching
 
-The caching system operates in three complementary layers. Each layer addresses a different part of the build process, and they work together for maximum benefit.
+The caching system operates in two complementary layers:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  Layer 3: Artifact Cache (Hardlinks)                            │
+│  Layer 2: Artifact Cache (Hardlinks)                            │
 │  - Caches entire target/ and node_modules/ directories          │
 │  - Instant environment creation on cache hit                    │
-│  - Keyed by lockfile hash                                       │
+│  - Keyed by lockfile + toolchain version                        │
 ├─────────────────────────────────────────────────────────────────┤
-│  Layer 2: Compilation Cache (sccache)                           │
-│  - Caches individual compiled units (.rlib, .o files)           │
+│  Layer 1: Compilation Cache (sccache)                           │
+│  - Caches individual compiled units (.rlib files)               │
 │  - Works even when lockfiles differ (shared deps hit cache)     │
-│  - Content-addressed by source + flags                          │
-├─────────────────────────────────────────────────────────────────┤
-│  Layer 1: Download Cache (Shared registries)                    │
-│  - Shared CARGO_HOME, npm cache across all environments         │
-│  - Downloads happen once, never repeated                        │
-│  - Always enabled, zero config                                  │
+│  - Uses sccache's default location                              │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-**Why three layers?**
+**Why two layers?**
 
-| Scenario                             | Layer 1       | Layer 2           | Layer 3                |
-| ------------------------------------ | ------------- | ----------------- | ---------------------- |
-| Same lockfile, same source           | Skip download | Skip compile      | Hardlink (instant)     |
-| Same lockfile, different source      | Skip download | Skip dep compile  | Hardlink + incremental |
-| Different lockfile, some shared deps | Skip download | Partial cache hit | Cache miss, rebuild    |
-| Completely different deps            | Skip download | Cache miss        | Cache miss             |
+| Scenario                             | Layer 1 (sccache) | Layer 2 (Hardlinks)    |
+| ------------------------------------ | ----------------- | ---------------------- |
+| Same lockfile, same source           | Skip compile      | Hardlink (instant)     |
+| Same lockfile, different source      | Skip dep compile  | Hardlink + incremental |
+| Different lockfile, some shared deps | Partial cache hit | Cache miss, rebuild    |
+| Completely different deps            | Cache miss        | Cache miss             |
 
-Layer 3 (hardlinks) is the fastest but requires identical lockfiles. Layer 2 (sccache) helps when lockfiles differ but share common dependencies. Layer 1 (downloads) always helps.
+Layer 2 (hardlinks) is the fastest but requires identical lockfiles. Layer 1 (sccache) helps when lockfiles differ but share common dependencies.
 
 ## Directory Structure
 
 ```
-project/
-├── .git/                         # shared by all worktrees
-├── .mono/
-│   ├── cargo/                    # Layer 1: shared CARGO_HOME
-│   │   ├── registry/             # downloaded crates
-│   │   └── git/                  # git dependencies
-│   ├── npm/                      # Layer 1: shared npm cache
-│   ├── sccache/                  # Layer 2: compiled unit cache
-│   └── cache/                    # Layer 3: artifact cache
-│       ├── cargo/
-│       │   ├── <hash>/
-│       │   │   └── target/       # cached build artifacts
-│       │   └── <hash>/
-│       │       └── target/       # different deps version
-│       └── npm/
-│           └── <hash>/
-│               └── node_modules/
-├── main/                         # primary worktree
-│   └── target/                   # hardlinked from cache
-└── environments/
-    ├── env_1/                    # worktree
-    │   └── target/               # hardlinked from cache (same hash)
-    └── env_2/                    # worktree on different branch
-        └── target/               # hardlinked from different cache entry
+~/.mono/
+└── cache_local/                      # artifact cache (Layer 2)
+    └── <project-id>/                 # 12-char hash of root path
+        ├── cargo/
+        │   └── <cache-key>/          # 16-char hash of lockfile + rustc version
+        │       └── target/
+        ├── npm-web/                  # artifact name includes subdirectory
+        │   └── <cache-key>/
+        │       └── node_modules/
+        └── yarn/
+            └── <cache-key>/
+                └── node_modules/
+
+# sccache uses its default location (Layer 1):
+# macOS: ~/Library/Caches/Mozilla.sccache
+# Linux: ~/.cache/sccache
 ```
 
-## Layer 1: Shared Download Cache
+**Project ID**: First 12 characters of `sha256(root_path)`. Ensures cache isolation per project.
 
-Mono automatically injects environment variables before running any script:
+**Cache Key**: First 16 characters of `sha256(lockfile_contents + toolchain_version)`.
 
-```bash
-export CARGO_HOME="$MONO_ROOT/.mono/cargo"
-export npm_config_cache="$MONO_ROOT/.mono/npm"
-export YARN_CACHE_FOLDER="$MONO_ROOT/.mono/yarn"
-export PNPM_HOME="$MONO_ROOT/.mono/pnpm"
-```
+## Layer 1: Compilation Cache (sccache)
 
-**Effect**: Downloads happen once. Subsequent environments skip network entirely.
-
-**Speed gain**: Moderate (saves download time, not compile time)
-
-**Concurrency**: Safe. Download caches are read-heavy, writes are atomic.
-
-**Configuration**: Always enabled. No user action required.
-
-## Layer 2: Compilation Cache (sccache)
-
-Mono wraps Rust compilation with sccache:
+Mono enables sccache for Rust compilation when available:
 
 ```bash
 export RUSTC_WRAPPER="sccache"
-export SCCACHE_DIR="$MONO_ROOT/.mono/sccache"
 ```
+
+sccache uses its default cache location (`~/Library/Caches/Mozilla.sccache` on macOS, `~/.cache/sccache` on Linux).
 
 **How sccache works**:
 
 1. Intercepts rustc invocations
 2. Computes hash of: source files + compiler flags + dependency artifacts
-3. On cache hit: returns cached `.rlib`/`.o` file immediately
+3. On cache hit: returns cached `.rlib` file immediately
 4. On cache miss: runs rustc, stores result in cache
 
 ```
@@ -132,12 +105,6 @@ Env 2: cargo build (different worktree, same Cargo.lock)
   └─ rustc my_crate → hash: xyz789 → MISS → compile (different source)
 ```
 
-**Effect**: Dependency compilation is shared without sharing directories. Even if two environments have slightly different lockfiles, any common dependencies get cache hits.
-
-**Speed gain**: High for dependencies (typically 80%+ of compile time)
-
-**Concurrency**: Safe. sccache handles its own locking internally.
-
 **Configuration**: Enabled by default if sccache is installed. Can be disabled:
 
 ```yaml
@@ -145,41 +112,54 @@ build:
   sccache: false
 ```
 
-## Layer 3: Artifact Cache (Hardlinks)
+## Layer 2: Artifact Cache (Hardlinks)
 
 The most aggressive optimization. Caches entire `target/` and `node_modules/` directories, keyed by lockfile hash.
 
 ### Cache Key Computation
 
-The cache key determines when artifacts can be reused. It includes all factors that affect the build output.
+The cache key is computed by hashing:
+1. Contents of key files (e.g., `Cargo.lock`, `package-lock.json`)
+2. Output of key commands (e.g., `rustc --version`, `node --version`)
 
-**Cargo cache key:**
-
-```
-sha256(
-  contents(Cargo.lock) +
-  rustc_version +
-  build_profile (debug|release)
-)
-```
-
-**npm cache key:**
-
-```
-sha256(
-  contents(package-lock.json) +
-  node_version
-)
+```go
+key = sha256(
+    file_contents(Cargo.lock) +
+    output_of("rustc --version")
+)[:16]
 ```
 
 Source files are intentionally excluded. Cargo/npm handle source-level incremental compilation internally. The cache key only captures "are the dependencies the same?"
+
+### Artifact Filtering (Cargo)
+
+When seeding cache from existing artifacts, mono skips files that are:
+- Redundant (embedded in other files)
+- Path-dependent (won't work in new location)
+- Build locks (indicate in-progress build)
+
+Filtered paths for cargo artifacts:
+- `*.o` files - object files embedded in `.rlib`
+- `*.d` files - dependency tracking, not needed
+- `incremental/` directory - contains absolute paths
+- `.cargo-lock` file - build lock file
+
+This typically reduces cache size by 30-40% compared to the full `target/` directory.
+
+### Post-Restore Fixes
+
+After restoring artifacts from cache, mono applies fixes to ensure builds work correctly:
+
+**Cargo**: Touches all `dep-*` files in `.fingerprint/` directories to update their modification times. This prevents cargo from unnecessarily rebuilding dependencies due to timestamp mismatches.
+
+**Node.js**: Removes the `.bin/` directory from `node_modules/`. Symlinks in `.bin/` contain absolute paths that won't work in the new location. npm/yarn/pnpm regenerate these on next install.
 
 ### Hardlink Mechanics
 
 Environments with identical dependencies share the same cached artifacts via hardlinks.
 
 ```
-function hardlink_tree(source_dir, target_dir):
+hardlink_tree(source_dir, target_dir):
     for each file in source_dir (recursive):
         if is_directory(file):
             mkdir(target_dir/relative_path)
@@ -195,8 +175,6 @@ Hardlinks share the same inode. When a program modifies a hardlinked file:
 
 This gives us copy-on-write behavior without explicit COW filesystem support.
 
-**Concurrency**: Safe. Each environment gets its own hardlinked tree. When cargo/npm modifies a file, only that environment's copy changes. Other environments are unaffected.
-
 ### Cache Storage Flow
 
 **On cache miss:**
@@ -205,9 +183,9 @@ This gives us copy-on-write behavior without explicit COW filesystem support.
 1. Run build script (cargo build, npm install)
 2. Compute cache key from lockfiles
 3. Move artifacts to cache:
-   mv env/target .mono/cache/cargo/<hash>/target
+   mv env/target ~/.mono/cache_local/<project>/<artifact>/<key>/target
 4. Hardlink back to environment:
-   hardlink_tree(.mono/cache/cargo/<hash>/target, env/target)
+   hardlink_tree(cache/target, env/target)
 ```
 
 **On cache hit:**
@@ -216,9 +194,36 @@ This gives us copy-on-write behavior without explicit COW filesystem support.
 1. Compute cache key
 2. Find matching cache entry
 3. Hardlink to environment:
-   hardlink_tree(.mono/cache/cargo/<hash>/target, env/target)
-4. Run build script (handles source-level changes incrementally)
+   hardlink_tree(cache/target, env/target)
+4. Apply post-restore fixes
+5. Run build script (handles source-level changes incrementally)
 ```
+
+### Seed from Root
+
+When creating a new environment, mono can seed the cache from the root project's existing artifacts. This happens automatically when:
+
+1. Root project has build artifacts (e.g., `target/`)
+2. Environment's lockfile matches root's lockfile
+3. No build is currently in progress in root
+
+This avoids the initial cold-cache penalty when the root project is already built.
+
+## Auto-Detection
+
+Mono automatically detects artifacts to cache by scanning for lockfiles:
+
+| Lockfile | Artifact Name | Cached Directory | Key Command |
+|----------|---------------|------------------|-------------|
+| `Cargo.lock` | `cargo` | `target/` | `rustc --version` |
+| `package-lock.json` | `npm` | `node_modules/` | `node --version` |
+| `yarn.lock` | `yarn` | `node_modules/` | `node --version` |
+| `pnpm-lock.yaml` | `pnpm` | `node_modules/` | `node --version` |
+| `bun.lock` / `bun.lockb` | `bun` | `node_modules/` | `bun --version` |
+
+Lockfiles in subdirectories are also detected. For example, `web/package-lock.json` creates an artifact named `npm-web` caching `web/node_modules/`.
+
+Directories skipped during detection: `node_modules`, `target`, `.git`, `vendor`, `dist`, `build`, `.next`, `.nuxt`.
 
 ## Configuration
 
@@ -237,164 +242,110 @@ scripts:
 ```
 
 Mono automatically:
+- Enables sccache if installed (Layer 1)
+- Detects lockfiles and enables artifact caching (Layer 2)
 
-- Injects shared download cache env vars (Layer 1)
-- Enables sccache if installed (Layer 2)
-- Detects `Cargo.lock` / `package-lock.json` and enables artifact caching (Layer 3)
-
-### Strategy Shorthand
-
-For simple cases, use a single strategy option:
-
-```yaml
-build:
-  strategy: layered # default: all three layers enabled
-  # strategy: compile  # layers 1+2 only, no hardlinks
-  # strategy: download # layer 1 only
-  # strategy: none     # no caching (fully isolated)
-```
-
-### Power User Configuration
+### Custom Artifact Configuration
 
 For fine-grained control:
 
 ```yaml
 build:
-  download_cache: true # Layer 1 (default: true)
-  sccache: true # Layer 2 (default: true if installed)
+  sccache: true  # default: true if sccache installed
 
-  artifacts: # Layer 3
+  artifacts:
     - name: cargo
       key_files: [Cargo.lock]
       key_commands: ["rustc --version"]
       paths: [target]
 
-    - name: npm
+    - name: npm-web
       key_files: [web/package-lock.json]
       key_commands: ["node --version"]
       paths: [web/node_modules]
-
-scripts:
-  build: |
-    cargo build
-    cd web && npm install
-```
-
-## Lifecycle Phases
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Environment Creation                          │
-├─────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. git worktree add                                            │
-│          │                                                       │
-│          ▼                                                       │
-│  2. inject cache env vars (CARGO_HOME, RUSTC_WRAPPER, etc.)     │
-│          │                                                       │
-│          ▼                                                       │
-│  3. compute artifact cache keys                                 │
-│          │                                                       │
-│          ▼                                                       │
-│  4. for each artifact cache:                                    │
-│          │                                                       │
-│          ├─── cache hit ──► hardlink from cache to env          │
-│          │                                                       │
-│          └─── cache miss ─► (deferred to build step)            │
-│                                                                  │
-│          ▼                                                       │
-│  5. run build script                                            │
-│          │                                                       │
-│          ▼                                                       │
-│  6. on cache miss: store artifacts in cache, re-hardlink        │
-│          │                                                       │
-│          ▼                                                       │
-│  7. run setup script                                            │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
 ```
 
 ## Concurrency Safety
 
-All caching layers are designed for concurrent access:
+Both caching layers are designed for concurrent access:
 
-| Layer          | Mechanism                 | Concurrent Safety |
-| -------------- | ------------------------- | ----------------- |
-| Download cache | Atomic writes, read-heavy | Safe              |
-| sccache        | Internal locking          | Safe              |
-| Hardlinks      | COW semantics per-file    | Safe              |
+| Layer     | Mechanism              | Concurrent Safety |
+| --------- | ---------------------- | ----------------- |
+| sccache   | Internal locking       | Safe              |
+| Hardlinks | COW semantics + flock  | Safe              |
+
+**Cache locking**: When storing artifacts to cache, mono acquires an exclusive file lock (`flock`) on `<cache-path>.lock`. If another process holds the lock, the operation is skipped (assumes another process is handling it).
+
+**Build detection**: Before seeding from root, mono checks for `.cargo-lock` file which indicates a cargo build is in progress. If detected, seeding is skipped.
 
 Multiple environments can run `cargo build` simultaneously without conflicts:
+- They share compiled dependency units via sccache (Layer 1)
+- They have isolated working copies via hardlinks (Layer 2)
 
-- They share downloaded crates (Layer 1)
-- They share compiled dependency units (Layer 2)
-- They have isolated working copies via hardlinks (Layer 3)
+## Lifecycle
 
-**Recommendation**: Default to npm + hardlinks for compatibility. Document pnpm as the recommended approach for heavy Node.js users.
-
-## Handling Build Profiles (Debug vs Release)
-
-Cargo stores debug and release builds in separate subdirectories (`target/debug`, `target/release`). Two options:
-
-**Option A: Single cache entry, both profiles**
-
-- Cache the entire `target/` directory
-- Simpler, but wastes space if only using one profile
-  Recommendation: **Option A** for simplicity. Disk space is cheaper than complexity.
-
-## Cache Management
-
-### Automatic Invalidation
-
-- Cache entries are keyed by content hash
-- Changing `Cargo.lock` produces a new hash → new cache entry
-- Old entries remain (may be used by other environments)
-
-### Manual Commands
-
-```bash
-mono cache stats             # show cache size, hits, and last used
-mono cache clean             # interactively select entries to remove
-mono cache clean --older-than 30d  # remove entries older than 30 days
-mono cache clean --all       # remove all cache entries
 ```
-
-## Environment Variables
-
-Available in scripts:
-
-| Variable               | Description                                          |
-| ---------------------- | ---------------------------------------------------- |
-| `MONO_CACHE_HIT`       | `true` if all artifact caches hit, `false` otherwise |
-| `MONO_CACHE_DIR`       | Path to `.mono/cache/`                               |
-| `MONO_CARGO_CACHE_KEY` | Current cargo artifact cache key                     |
-| `MONO_NPM_CACHE_KEY`   | Current npm artifact cache key                       |
-| `CARGO_HOME`           | Auto-injected shared cargo home                      |
-| `SCCACHE_DIR`          | Auto-injected sccache directory                      |
+┌─────────────────────────────────────────────────────────────────┐
+│                    Environment Creation (mono init)             │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  1. git worktree add                                            │
+│          │                                                      │
+│          ▼                                                      │
+│  2. compute artifact cache keys                                 │
+│          │                                                      │
+│          ▼                                                      │
+│  3. check for cache hits                                        │
+│          │                                                      │
+│          ├─── all hits ──► restore from cache, apply fixes      │
+│          │                                                      │
+│          └─── any miss ──► seed from root (if available)        │
+│                   │                                             │
+│                   ▼                                             │
+│          4. re-check cache (seed may have populated it)         │
+│                   │                                             │
+│                   ├─── hit ──► restore from cache               │
+│                   │                                             │
+│                   └─── miss ──► continue without cache          │
+│          │                                                      │
+│          ▼                                                      │
+│  5. inject RUSTC_WRAPPER=sccache (if available)                 │
+│          │                                                      │
+│          ▼                                                      │
+│  6. run init script                                             │
+│          │                                                      │
+│          ▼                                                      │
+│  7. store new artifacts to cache (for misses)                   │
+│          │                                                      │
+│          ▼                                                      │
+│  8. run setup script                                            │
+│                                                                 │
+└─────────────────────────────────────────────────────────────────┘
+```
 
 ## Edge Cases
 
 **1. Corrupted cache entry**
 
-If a cache entry is corrupted (partial write, disk error), remove it and let the next build recreate it:
+If a cache entry is corrupted (partial write, disk error), delete it manually:
 
+```bash
+rm -rf ~/.mono/cache_local/<project-id>/<artifact>/<key>
 ```
-mono cache clean              # select and remove the corrupted entry
-```
+
+The next environment creation will rebuild and re-cache.
 
 **2. Lockfile changes mid-session**
 
 If a user modifies `Cargo.lock` in an environment:
-
 - Current environment continues using its hardlinked artifacts
-- Next `mono sync` or `mono build` recomputes the hash
-- If new hash exists in cache: re-hardlink
-- If not: build and cache
+- Next `mono init` computes a new hash
+- If new hash exists in cache: restore from cache
+- If not: build and cache with new key
 
 **3. Multiple environments modifying same cached files**
 
 Not possible. Hardlinks provide isolation:
-
 - Env A and Env B both link to cached file X
 - Env A's cargo build modifies X
 - Filesystem creates a new file for Env A, breaks the hardlink
@@ -402,104 +353,32 @@ Not possible. Hardlinks provide isolation:
 
 **4. Filesystem doesn't support hardlinks**
 
-Fall back to regular copy. Log a warning:
-
-```
-warning: hardlinks not supported on this filesystem, falling back to copy
-```
+Fall back to regular copy. This happens automatically when `os.Link()` returns an error.
 
 **5. Cache directory on different filesystem**
 
-Hardlinks don't work across filesystems. Options:
-
-- Error with helpful message
-- Fall back to copy
-- Recommend moving project to same filesystem as home directory
+Hardlinks don't work across filesystems. Mono detects "cross-device link" errors and falls back to copying.
 
 **6. sccache not installed**
 
-Layer 2 is skipped. Layers 1 and 3 still provide significant benefits. Log info:
+Layer 1 is skipped. Layer 2 (hardlinks) still provides significant benefits.
 
-```
-info: sccache not found, compilation caching disabled
-hint: install sccache for faster builds: cargo install sccache
-```
+**7. Build in progress**
+
+If `.cargo-lock` exists in the source directory, seeding is skipped to avoid copying incomplete artifacts.
 
 ## Performance Characteristics
 
-| Operation      | No Caching | Layer 1 Only | Layers 1+2 | All Layers (hit) |
-| -------------- | ---------- | ------------ | ---------- | ---------------- |
-| Download deps  | Full       | Skip         | Skip       | Skip             |
-| Compile deps   | Full       | Full         | Skip       | Skip             |
-| Link artifacts | N/A        | N/A          | N/A        | Instant          |
-| Compile source | Full       | Full         | Full       | Incremental      |
+| Operation      | No Caching | sccache Only | Both Layers (hit) |
+| -------------- | ---------- | ------------ | ----------------- |
+| Compile deps   | Full       | Skip         | Skip              |
+| Link artifacts | N/A        | N/A          | Instant           |
+| Compile source | Full       | Full         | Incremental       |
 
 Typical improvements:
-
 - Environment creation: **minutes → seconds** (on full cache hit)
-- Disk usage: **~80% reduction** (for similar environments)
+- Disk usage: **~60-80% reduction** (via hardlinks + filtering)
 - Build time: **60-90% reduction** (via sccache, even on artifact cache miss)
-
-## Implementation Phases
-
-See `design/phase*.md` for detailed implementation specs.
-
-### Phase 1: Shared Caches (Layer 1 + 2)
-
-- Auto-inject `CARGO_HOME`, `npm_config_cache` env vars
-- Detect sccache installation, set `RUSTC_WRAPPER` if available
-- Global cache directory at `~/.mono/`
-
-### Phase 2: Artifact Cache (Layer 3)
-
-- Implement cache key computation
-- Implement hardlink_tree function
-- Basic cache storage/retrieval
-- Auto-detect Cargo.lock / package-lock.json
-
-### Phase 2a: Sync
-
-- `mono sync` command to update environment from git changes
-- Re-hardlink artifacts after lockfile changes
-- Rebuild only when necessary
-
-### Phase 2b: Seed
-
-- `mono seed` command to pre-populate cache
-- Build artifacts without creating an environment
-- Useful for CI warming or team cache sharing
-
-### Phase 3: Cache Management
-
-- `mono cache stats` - show size, hits, last used per entry
-- `mono cache clean` - interactive selection or `--older-than`/`--all` flags
-- DB tracking for hit/miss events
-
-## Open Questions
-
-1. **Should `build` script always run after cache restore?**
-
-   - Yes: Ensures source changes are compiled
-   - No: Faster, but user must run manually
-   - Recommendation: Yes, but make it skippable with `--no-build`
-
-2. **How to handle environments that intentionally diverge?**
-
-   - User modifies deps, wants isolation
-   - Current design handles this: new lockfile → new cache key
-   - Consider: `mono env detach` to explicitly break cache link
-
-3. **Cache size limits?**
-
-   - No limit by default
-   - Optional config: `cache.max_size: 10GB`
-   - LRU eviction when limit reached
-
-4. **sccache dependency management?**
-   - Option A: Expect users to install sccache themselves
-   - Option B: Bundle sccache with mono
-   - Option C: Offer to install on first run
-   - Recommendation: Option A with helpful messaging
 
 ## Alternatives Considered
 
@@ -508,7 +387,6 @@ See `design/phase*.md` for detailed implementation specs.
 All worktrees share a single `target/` directory via `CARGO_TARGET_DIR` environment variable.
 
 **Rejected because:**
-
 - Cargo's incremental compilation thrashes when switching between different source states
 - No isolation between environments
 - Confusing behavior when running multiple environments simultaneously
@@ -518,18 +396,15 @@ All worktrees share a single `target/` directory via `CARGO_TARGET_DIR` environm
 Use `cp -c` on macOS for instant COW copies.
 
 **Rejected because:**
-
 - Platform-specific (macOS only)
 - Requires same filesystem
 - Hardlinks achieve similar benefits more portably
-- Could be added as optional optimization for macOS users later
 
 ### Symlinks instead of hardlinks
 
 Symlink entire `target/` directory to cache.
 
 **Rejected because:**
-
 - All environments would share the exact same directory
 - No isolation: one environment's build affects others
 - Can't support environments with different dependency versions
