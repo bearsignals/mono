@@ -495,7 +495,7 @@ func Attach(path string) error {
 		project, workspace := DeriveNames(env.Path)
 		envName := fmt.Sprintf("%s-%s", project, workspace)
 		if project == "" || workspace == "" {
-			envName = filepath.Base(env.Path)
+			envName = GetProjectName(env.Path)
 		}
 		sessionName = SessionName(envName)
 	} else {
