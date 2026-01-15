@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 )
 
@@ -478,6 +479,89 @@ func List() ([]EnvironmentStatus, error) {
 	}
 
 	return statuses, nil
+}
+
+func Attach(path string) error {
+	db, err := OpenDB()
+	if err != nil {
+		return fmt.Errorf("failed to open database: %w", err)
+	}
+	defer db.Close()
+
+	var sessionName string
+
+	env, err := db.GetEnvironmentByPath(path)
+	if err == nil {
+		project, workspace := DeriveNames(env.Path)
+		envName := fmt.Sprintf("%s-%s", project, workspace)
+		if project == "" || workspace == "" {
+			envName = filepath.Base(env.Path)
+		}
+		sessionName = SessionName(envName)
+	} else {
+		sessions, err := ListMonoSessions()
+		if err != nil {
+			return fmt.Errorf("failed to list sessions: %w", err)
+		}
+		if len(sessions) == 0 {
+			return fmt.Errorf("no running mono sessions")
+		}
+
+		selected, err := selectSessionWithFzf(sessions)
+		if err != nil {
+			return fmt.Errorf("failed to select session: %w", err)
+		}
+		if selected == "" {
+			return nil
+		}
+		sessionName = selected
+	}
+
+	if !SessionExists(sessionName) {
+		return fmt.Errorf("session not running: %s", sessionName)
+	}
+
+	if IsInsideTmux() {
+		return Command("tmux", "switch-client", "-t", sessionName).Run()
+	}
+
+	cmd := exec.Command("tmux", "attach-session", "-t", sessionName)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+func selectSessionWithFzf(sessions []string) (string, error) {
+	if _, err := exec.LookPath("fzf"); err != nil {
+		return "", fmt.Errorf("fzf not found (install with: brew install fzf)")
+	}
+
+	fzf := exec.Command("fzf",
+		"--height=~15",
+		"--layout=reverse-list",
+		"--no-info",
+		"--no-separator",
+		"--pointer=>",
+		"--prompt=attach> ",
+	)
+	fzf.Stdin = strings.NewReader(strings.Join(sessions, "\n"))
+	fzf.Stderr = os.Stderr
+
+	output, err := fzf.Output()
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 130 {
+			return "", nil
+		}
+		return "", nil
+	}
+
+	selected := strings.TrimSpace(string(output))
+	if selected == "" {
+		return "", nil
+	}
+
+	return selected, nil
 }
 
 func runScript(workDir, script string, envVars []string, extraEnvVars []string, logger *FileLogger) error {
