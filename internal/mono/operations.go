@@ -180,9 +180,9 @@ func Init(path string) error {
 	var allocations []Allocation
 
 	if cfg.Scripts.Init != "" {
-		monoEnv := BuildEnv(envName, envID, path, rootPath, allocations)
+		scriptEnv := buildScriptEnv(envName, envID, path, rootPath, allocations, cfg.Env, cacheEnvVars)
 		logger.Log("running init script: %s", cfg.Scripts.Init)
-		if err := runScript(path, cfg.Scripts.Init, monoEnv.ToEnvSlice(), cacheEnvVars, logger); err != nil {
+		if err := runScript(path, cfg.Scripts.Init, scriptEnv, logger); err != nil {
 			cleanupWithDB()
 			return fmt.Errorf("init script failed: %w", err)
 		}
@@ -237,9 +237,9 @@ func Init(path string) error {
 	}
 
 	if cfg.Scripts.Setup != "" {
-		monoEnv := BuildEnv(envName, envID, path, rootPath, allocations)
+		scriptEnv := buildScriptEnv(envName, envID, path, rootPath, allocations, cfg.Env, cacheEnvVars)
 		logger.Log("running setup script: %s", cfg.Scripts.Setup)
-		if err := runScript(path, cfg.Scripts.Setup, monoEnv.ToEnvSlice(), cacheEnvVars, logger); err != nil {
+		if err := runScript(path, cfg.Scripts.Setup, scriptEnv, logger); err != nil {
 			if !isSimpleMode {
 				StopContainers(dockerProject, path, true, nil, nil)
 			}
@@ -249,10 +249,9 @@ func Init(path string) error {
 		logger.Log("setup script completed")
 	}
 
-	monoEnv := BuildEnv(envName, envID, path, rootPath, allocations)
 	sessionName := SessionName(envName)
-	sessionEnvVars := append(monoEnv.ToEnvSlice(), cacheEnvVars...)
-	if err := CreateSession(sessionName, path, sessionEnvVars); err != nil {
+	sessionEnv := buildScriptEnv(envName, envID, path, rootPath, allocations, cfg.Env, cacheEnvVars)
+	if err := CreateSession(sessionName, path, sessionEnv); err != nil {
 		logger.Log("warning: failed to create tmux session: %v", err)
 	} else {
 		logger.Log("created tmux session %s", sessionName)
@@ -329,9 +328,9 @@ func Destroy(path string) error {
 	cacheEnvVars = append(cacheEnvVars, "MONO_CACHE_DIR="+cm.LocalCacheDir)
 
 	if cfg != nil && cfg.Scripts.Destroy != "" {
-		monoEnv := BuildEnv(envName, env.ID, path, rootPath, nil)
+		scriptEnv := buildScriptEnv(envName, env.ID, path, rootPath, nil, cfg.Env, cacheEnvVars)
 		logger.Log("running destroy script: %s", cfg.Scripts.Destroy)
-		if err := runScript(path, cfg.Scripts.Destroy, monoEnv.ToEnvSlice(), cacheEnvVars, logger); err != nil {
+		if err := runScript(path, cfg.Scripts.Destroy, scriptEnv, logger); err != nil {
 			logger.Log("warning: destroy script failed: %v", err)
 		} else {
 			logger.Log("destroy script completed")
@@ -564,6 +563,44 @@ func selectSessionWithFzf(sessions []string) (string, error) {
 	return selected, nil
 }
 
+func buildScriptEnv(envName string, envID int64, envPath, rootPath string, allocations []Allocation, configEnv map[string]string, cacheEnvVars []string) []string {
+	home, _ := os.UserHomeDir()
+	dataDir := filepath.Join(home, ".mono", "data", envName)
+
+	monoEnvMap := map[string]string{
+		"MONO_ENV_NAME":  envName,
+		"MONO_ENV_ID":    fmt.Sprintf("%d", envID),
+		"MONO_ENV_PATH":  envPath,
+		"MONO_ROOT_PATH": rootPath,
+		"MONO_DATA_DIR":  dataDir,
+	}
+
+	for _, alloc := range allocations {
+		varName := "MONO_" + strings.ToUpper(strings.ReplaceAll(alloc.Service, "-", "_")) + "_PORT"
+		monoEnvMap[varName] = fmt.Sprintf("%d", alloc.HostPort)
+	}
+
+	var result []string
+	for key, value := range monoEnvMap {
+		result = append(result, fmt.Sprintf("%s=%s", key, value))
+	}
+
+	if len(configEnv) > 0 {
+		for key, value := range configEnv {
+			expanded := os.Expand(value, func(k string) string {
+				if val, ok := monoEnvMap[k]; ok {
+					return val
+				}
+				return os.Getenv(k)
+			})
+			result = append(result, fmt.Sprintf("%s=%s", key, expanded))
+		}
+	}
+
+	result = append(result, cacheEnvVars...)
+	return result
+}
+
 func runScript(workDir, script string, envVars []string, extraEnvVars []string, logger *FileLogger) error {
 	stdout := NewLogWriter(logger, "out")
 	stderr := NewLogWriter(logger, "err")
@@ -573,7 +610,6 @@ func runScript(workDir, script string, envVars []string, extraEnvVars []string, 
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	cmd.Env = append(os.Environ(), envVars...)
-	cmd.Env = append(cmd.Env, extraEnvVars...)
 
 	done := make(chan error, 1)
 	go func() {

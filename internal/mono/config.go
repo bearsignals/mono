@@ -23,8 +23,9 @@ type BuildConfig struct {
 }
 
 type Config struct {
-	Scripts Scripts     `yaml:"scripts"`
-	Build   BuildConfig `yaml:"build"`
+	Scripts Scripts           `yaml:"scripts"`
+	Build   BuildConfig       `yaml:"build"`
+	Env     map[string]string `yaml:"env"`
 }
 
 type Scripts struct {

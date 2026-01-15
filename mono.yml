@@ -1,5 +1,8 @@
+env:
+  MONO_HOME: "${MONO_DATA_DIR}"
+
 scripts:
-  init: "echo 'Running init script' && go mod download"
-  setup: "echo 'Running setup script'"
+  init: "go mod download"
+  setup: ""
   run: "go run ./cmd/mono list"
-  destroy: "echo 'Cleaning up'"
+  destroy: ""

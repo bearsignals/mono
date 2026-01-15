@@ -38,14 +38,20 @@ type DB struct {
 }
 
 func DBPath() (string, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return "", fmt.Errorf("failed to get home directory: %w", err)
+	var monoDir string
+
+	if customHome := os.Getenv("MONO_HOME"); customHome != "" {
+		monoDir = customHome
+	} else {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return "", fmt.Errorf("failed to get home directory: %w", err)
+		}
+		monoDir = filepath.Join(home, ".mono")
 	}
 
-	monoDir := filepath.Join(home, ".mono")
 	if err := os.MkdirAll(monoDir, 0755); err != nil {
-		return "", fmt.Errorf("failed to create ~/.mono directory: %w", err)
+		return "", fmt.Errorf("failed to create mono directory: %w", err)
 	}
 
 	return filepath.Join(monoDir, "state.db"), nil
