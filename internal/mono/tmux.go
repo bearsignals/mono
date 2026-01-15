@@ -74,3 +74,55 @@ func ListMonoSessions() ([]string, error) {
 	}
 	return sessions, nil
 }
+
+type TmuxManager struct {
+	sessionName string
+	workDir     string
+	config      TmuxConfig
+}
+
+func NewTmuxManager(sessionName, workDir string, config TmuxConfig) *TmuxManager {
+	return &TmuxManager{
+		sessionName: sessionName,
+		workDir:     workDir,
+		config:      config,
+	}
+}
+
+func (tm *TmuxManager) CreateSession(envVars []string) error {
+	return CreateSession(tm.sessionName, tm.workDir, envVars)
+}
+
+func (tm *TmuxManager) SessionExists() bool {
+	return SessionExists(tm.sessionName)
+}
+
+func (tm *TmuxManager) KillSession() error {
+	return KillSession(tm.sessionName)
+}
+
+func (tm *TmuxManager) Run(scriptPath string) error {
+	if tm.config.Run.OnConflict == "respawn" {
+		return tm.respawn(fmt.Sprintf("source %s", scriptPath))
+	}
+	tm.interrupt()
+	tm.sendKeys(fmt.Sprintf("cd %q", tm.workDir))
+	return tm.sendKeys("source " + scriptPath)
+}
+
+func (tm *TmuxManager) interrupt() error {
+	return Command("tmux", "send-keys", "-t", tm.sessionName, "C-c").
+		Timeout(tmuxTimeout).
+		Run()
+}
+
+func (tm *TmuxManager) respawn(cmd string) error {
+	fullCmd := fmt.Sprintf("cd %q && %s", tm.workDir, cmd)
+	return Command("tmux", "respawn-pane", "-k", "-t", tm.sessionName, fullCmd).
+		Timeout(tmuxTimeout).
+		Run()
+}
+
+func (tm *TmuxManager) sendKeys(keys string) error {
+	return SendKeys(tm.sessionName, keys)
+}

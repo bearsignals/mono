@@ -252,7 +252,8 @@ func Init(path string) error {
 
 	sessionName := SessionName(envName)
 	sessionEnv := buildScriptEnv(envName, envID, path, rootPath, allocations, cfg.Env, cacheEnvVars)
-	if err := CreateSession(sessionName, path, sessionEnv); err != nil {
+	tm := NewTmuxManager(sessionName, path, cfg.Tmux)
+	if err := tm.CreateSession(sessionEnv); err != nil {
 		logger.Log("warning: failed to create tmux session: %v", err)
 	} else {
 		logger.Log("created tmux session %s", sessionName)
@@ -344,8 +345,13 @@ func Destroy(path string) error {
 	}
 
 	sessionName := SessionName(envName)
-	if SessionExists(sessionName) {
-		if err := KillSession(sessionName); err != nil {
+	var tmuxCfg TmuxConfig
+	if cfg != nil {
+		tmuxCfg = cfg.Tmux
+	}
+	tm := NewTmuxManager(sessionName, path, tmuxCfg)
+	if tm.SessionExists() {
+		if err := tm.KillSession(); err != nil {
 			logger.Log("warning: failed to kill tmux session: %v", err)
 		} else {
 			logger.Log("killed tmux session %s", sessionName)
@@ -410,13 +416,15 @@ func Run(path string) error {
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
+	cfg.Tmux.ApplyDefaults()
 
 	if cfg.Scripts.Run == "" {
 		return fmt.Errorf("no run script defined in mono.yml")
 	}
 
 	sessionName := SessionName(envName)
-	if !SessionExists(sessionName) {
+	tm := NewTmuxManager(sessionName, path, cfg.Tmux)
+	if !tm.SessionExists() {
 		return fmt.Errorf("tmux session does not exist: %s", sessionName)
 	}
 
@@ -431,14 +439,9 @@ func Run(path string) error {
 		return fmt.Errorf("failed to write run script: %w", err)
 	}
 
-	logger.Log("sending to tmux: %s", fmt.Sprintf("cd %q", path))
-	if err := SendKeys(sessionName, fmt.Sprintf("cd %q", path)); err != nil {
-		return fmt.Errorf("failed to reset to workspace root: %w", err)
-	}
-
-	logger.Log("sending to tmux: source %s", scriptPath)
-	if err := SendKeys(sessionName, "source "+scriptPath); err != nil {
-		return fmt.Errorf("failed to send keys to tmux: %w", err)
+	logger.Log("running script via tmux (on_conflict: %s)", cfg.Tmux.Run.OnConflict)
+	if err := tm.Run(scriptPath); err != nil {
+		return fmt.Errorf("failed to run script: %w", err)
 	}
 
 	fmt.Printf("Session: %s\n", sessionName)

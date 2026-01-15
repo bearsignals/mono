@@ -27,6 +27,7 @@ type Config struct {
 	Build      BuildConfig       `yaml:"build"`
 	Env        map[string]string `yaml:"env"`
 	ComposeDir string            `yaml:"compose_dir"`
+	Tmux       TmuxConfig        `yaml:"tmux"`
 }
 
 type Scripts struct {
@@ -34,6 +35,20 @@ type Scripts struct {
 	Setup   string `yaml:"setup"`
 	Run     string `yaml:"run"`
 	Destroy string `yaml:"destroy"`
+}
+
+type TmuxRunConfig struct {
+	OnConflict string `yaml:"on_conflict"`
+}
+
+type TmuxConfig struct {
+	Run TmuxRunConfig `yaml:"run"`
+}
+
+func (tc *TmuxConfig) ApplyDefaults() {
+	if tc.Run.OnConflict == "" {
+		tc.Run.OnConflict = "interrupt"
+	}
 }
 
 func LoadConfig(dir string) (*Config, error) {
@@ -59,6 +74,7 @@ func (c *Config) ApplyDefaults(envPath string) {
 	if len(c.Build.Artifacts) == 0 {
 		c.Build.Artifacts = detectArtifacts(envPath)
 	}
+	c.Tmux.ApplyDefaults()
 }
 
 func (c *Config) ResolveComposeDir(basePath string) string {
