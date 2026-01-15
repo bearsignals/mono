@@ -91,6 +91,11 @@ func Init(path string) error {
 			cacheEntries = entries
 		}
 
+		initialHits := make(map[string]bool)
+		for _, entry := range cacheEntries {
+			initialHits[entry.Name] = entry.Hit
+		}
+
 		hasMiss := false
 		for _, entry := range cacheEntries {
 			if !entry.Hit {
@@ -100,10 +105,8 @@ func Init(path string) error {
 		}
 
 		if hasMiss {
-			if err := cm.SeedFromRoot(cfg.Build.Artifacts, rootPath, path); err != nil {
+			if err := cm.SeedFromRoot(cfg.Build.Artifacts, rootPath, path, logger); err != nil {
 				logger.Log("warning: failed to seed cache from root: %v", err)
-			} else {
-				logger.Log("attempted to seed cache from project root")
 			}
 
 			entries, err := cm.PrepareArtifactCache(cfg.Build.Artifacts, rootPath, path)
@@ -118,8 +121,13 @@ func Init(path string) error {
 		for i := range cacheEntries {
 			entry := &cacheEntries[i]
 			if entry.Hit {
-				logger.Log("cache hit for %s (key: %s)", entry.Name, entry.Key)
-				if err := cm.RestoreFromCache(*entry); err != nil {
+				wasSeeded := !initialHits[entry.Name]
+				if wasSeeded {
+					logger.Log("seeded %s from root (key: %s)", entry.Name, entry.Key)
+				} else {
+					logger.Log("cache hit for %s (key: %s)", entry.Name, entry.Key)
+				}
+				if err := cm.RestoreFromCache(*entry, logger); err != nil {
 					logger.Log("warning: failed to restore cache: %v", err)
 					entry.Hit = false
 				} else {
@@ -242,7 +250,8 @@ func Init(path string) error {
 
 	monoEnv := BuildEnv(envName, envID, path, rootPath, allocations)
 	sessionName := SessionName(envName)
-	if err := CreateSession(sessionName, path, monoEnv.ToEnvSlice()); err != nil {
+	sessionEnvVars := append(monoEnv.ToEnvSlice(), cacheEnvVars...)
+	if err := CreateSession(sessionName, path, sessionEnvVars); err != nil {
 		logger.Log("warning: failed to create tmux session: %v", err)
 	} else {
 		logger.Log("created tmux session %s", sessionName)
@@ -295,22 +304,33 @@ func Destroy(path string) error {
 		rootPath = env.RootPath.String
 	}
 
-	if cfg != nil && rootPath != "" {
+	cm, err := NewCacheManager()
+	if err != nil {
+		return fmt.Errorf("failed to initialize cache: %w", err)
+	}
+
+	if cfg != nil {
 		cfg.ApplyDefaults(path)
-		cm, err := NewCacheManager()
-		if err == nil {
-			if err := cm.Sync(cfg.Build.Artifacts, rootPath, path, SyncOptions{HardlinkBack: false}); err != nil {
-				logger.Log("warning: failed to sync before destroy: %v", err)
-			} else {
-				logger.Log("synced artifacts to cache before destroy")
-			}
+	}
+
+	if cfg != nil && rootPath != "" {
+		if err := cm.Sync(cfg.Build.Artifacts, rootPath, path, SyncOptions{HardlinkBack: false}); err != nil {
+			logger.Log("warning: failed to sync before destroy: %v", err)
+		} else {
+			logger.Log("synced artifacts to cache before destroy")
 		}
 	}
+
+	var cacheEnvVars []string
+	if cfg != nil {
+		cacheEnvVars = cm.EnvVars(cfg.Build)
+	}
+	cacheEnvVars = append(cacheEnvVars, "MONO_CACHE_DIR="+cm.LocalCacheDir)
 
 	if cfg != nil && cfg.Scripts.Destroy != "" {
 		monoEnv := BuildEnv(envName, env.ID, path, rootPath, nil)
 		logger.Log("running destroy script: %s", cfg.Scripts.Destroy)
-		if err := runScript(path, cfg.Scripts.Destroy, monoEnv.ToEnvSlice(), nil, logger); err != nil {
+		if err := runScript(path, cfg.Scripts.Destroy, monoEnv.ToEnvSlice(), cacheEnvVars, logger); err != nil {
 			logger.Log("warning: destroy script failed: %v", err)
 		} else {
 			logger.Log("destroy script completed")
