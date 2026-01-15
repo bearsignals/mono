@@ -431,6 +431,11 @@ func Run(path string) error {
 		return fmt.Errorf("failed to write run script: %w", err)
 	}
 
+	logger.Log("sending to tmux: %s", fmt.Sprintf("cd %q", path))
+	if err := SendKeys(sessionName, fmt.Sprintf("cd %q", path)); err != nil {
+		return fmt.Errorf("failed to reset to workspace root: %w", err)
+	}
+
 	logger.Log("sending to tmux: source %s", scriptPath)
 	if err := SendKeys(sessionName, "source "+scriptPath); err != nil {
 		return fmt.Errorf("failed to send keys to tmux: %w", err)
