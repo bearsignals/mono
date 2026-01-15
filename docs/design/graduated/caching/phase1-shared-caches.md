@@ -8,21 +8,26 @@ This phase enables sccache for Rust compilation caching. This is a low-effort, h
 
 **What about download caches?** Cargo, npm, yarn, and pnpm already cache downloads globally by default (`~/.cargo`, `~/.npm`, etc.). We don't need to configure anything - it just works.
 
-## Design Decision: sccache in `~/.mono/cache_global/`
+## Design Decision: Use sccache's Default Location
 
-sccache cache lives in `~/.mono/cache_global/sccache`:
+Mono enables sccache by setting `RUSTC_WRAPPER=sccache`. sccache uses its own default cache location:
+- macOS: `~/Library/Caches/Mozilla.sccache`
+- Linux: `~/.cache/sccache`
 
 ```
 ~/.mono/
 ├── state.db              # existing
 ├── mono.log              # existing
 ├── data/                 # existing
-├── cache_global/
-│   └── sccache/          # compilation cache
 └── cache_local/          # Phase 2: per-project artifact cache
 ```
 
-**Why configure sccache but not CARGO_HOME/npm?**
+**Why not configure SCCACHE_DIR?**
+- sccache's default location works well
+- Avoids complexity of managing custom paths
+- Users can override SCCACHE_DIR themselves if needed
+
+**Why not configure CARGO_HOME/npm?**
 - Download caches already work globally by default
 - Changing CARGO_HOME breaks access to user's `cargo install`ed binaries
 - sccache is not enabled by default - we add value by enabling it
@@ -67,9 +72,7 @@ import (
 
 type CacheManager struct {
     HomeDir          string
-    GlobalCacheDir   string
     LocalCacheDir    string
-    SccacheDir       string
     SccacheAvailable bool
 }
 
@@ -79,14 +82,9 @@ func NewCacheManager() (*CacheManager, error) {
         return nil, err
     }
 
-    globalCacheDir := filepath.Join(homeDir, "cache_global")
-    localCacheDir := filepath.Join(homeDir, "cache_local")
-
     cm := &CacheManager{
-        HomeDir:        homeDir,
-        GlobalCacheDir: globalCacheDir,
-        LocalCacheDir:  localCacheDir,
-        SccacheDir:     filepath.Join(globalCacheDir, "sccache"),
+        HomeDir:       homeDir,
+        LocalCacheDir: filepath.Join(homeDir, "cache_local"),
     }
 
     cm.SccacheAvailable = cm.detectSccache()
@@ -108,11 +106,6 @@ func (cm *CacheManager) detectSccache() bool {
 }
 
 func (cm *CacheManager) EnsureDirectories() error {
-    if cm.SccacheAvailable {
-        if err := os.MkdirAll(cm.SccacheDir, 0755); err != nil {
-            return err
-        }
-    }
     return nil
 }
 
@@ -120,10 +113,7 @@ func (cm *CacheManager) EnvVars(cfg BuildConfig) []string {
     var vars []string
 
     if cm.shouldEnableSccache(cfg) {
-        vars = append(vars,
-            "RUSTC_WRAPPER=sccache",
-            "SCCACHE_DIR="+cm.SccacheDir,
-        )
+        vars = append(vars, "RUSTC_WRAPPER=sccache")
     }
 
     return vars
@@ -205,7 +195,6 @@ func runScript(script string, env MonoEnv, extraEnvVars []string, logger *EnvLog
    ```bash
    mono init ./env1
    # Should see: "sccache detected, compilation caching enabled"
-   # Verify directory: ls ~/.mono/cache_global/sccache/
    ```
 
 2. **Verify env vars are set**
@@ -214,13 +203,11 @@ func runScript(script string, env MonoEnv, extraEnvVars []string, logger *EnvLog
    scripts:
      init: |
        echo "RUSTC_WRAPPER=$RUSTC_WRAPPER"
-       echo "SCCACHE_DIR=$SCCACHE_DIR"
    ```
    ```bash
    mono init ./test-env
    # Output should show:
    # RUSTC_WRAPPER=sccache
-   # SCCACHE_DIR=/Users/you/.mono/cache_global/sccache
    ```
 
 3. **Verify sccache works**
@@ -270,8 +257,7 @@ func runScript(script string, env MonoEnv, extraEnvVars []string, logger *EnvLog
 
 ## Acceptance Criteria
 
-- [ ] `~/.mono/cache_global/sccache` directory created when sccache available
-- [ ] `RUSTC_WRAPPER=sccache` and `SCCACHE_DIR` injected into scripts when sccache available
+- [ ] `RUSTC_WRAPPER=sccache` injected into scripts when sccache available
 - [ ] sccache auto-detected via `exec.LookPath`
 - [ ] sccache can be disabled via `build.sccache: false` in config
 - [ ] `sccache -s` shows cache hits for repeated builds
@@ -288,8 +274,10 @@ build:
   sccache: false
 ```
 
-Or globally by removing the cache directory:
+Or globally by clearing sccache's default cache:
 
 ```bash
-rm -rf ~/.mono/cache_global/sccache
+sccache --stop-server
+rm -rf ~/Library/Caches/Mozilla.sccache  # macOS
+rm -rf ~/.cache/sccache                   # Linux
 ```

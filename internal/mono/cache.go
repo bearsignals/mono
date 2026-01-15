@@ -20,9 +20,7 @@ import (
 
 type CacheManager struct {
 	HomeDir          string
-	GlobalCacheDir   string
 	LocalCacheDir    string
-	SccacheDir       string
 	SccacheAvailable bool
 }
 
@@ -32,14 +30,9 @@ func NewCacheManager() (*CacheManager, error) {
 		return nil, err
 	}
 
-	globalCacheDir := filepath.Join(homeDir, "cache_global")
-	localCacheDir := filepath.Join(homeDir, "cache_local")
-
 	cm := &CacheManager{
-		HomeDir:        homeDir,
-		GlobalCacheDir: globalCacheDir,
-		LocalCacheDir:  localCacheDir,
-		SccacheDir:     filepath.Join(globalCacheDir, "sccache"),
+		HomeDir:       homeDir,
+		LocalCacheDir: filepath.Join(homeDir, "cache_local"),
 	}
 
 	cm.SccacheAvailable = cm.detectSccache()
@@ -148,11 +141,6 @@ func dirExists(path string) bool {
 }
 
 func (cm *CacheManager) EnsureDirectories() error {
-	if cm.SccacheAvailable {
-		if err := os.MkdirAll(cm.SccacheDir, 0755); err != nil {
-			return err
-		}
-	}
 	return nil
 }
 
@@ -160,10 +148,7 @@ func (cm *CacheManager) EnvVars(cfg BuildConfig) []string {
 	var vars []string
 
 	if cm.shouldEnableSccache(cfg) {
-		vars = append(vars,
-			"RUSTC_WRAPPER=sccache",
-			"SCCACHE_DIR="+cm.SccacheDir,
-		)
+		vars = append(vars, "RUSTC_WRAPPER=sccache")
 	}
 
 	return vars
