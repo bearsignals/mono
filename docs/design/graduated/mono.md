@@ -1,6 +1,6 @@
 # mono
 
-A runtime backend for Conductor. Manages execution environments for workspaces.
+mono is a backend for conductor.build, that allows developers to create parallel and isolated development environments for each conductor workspace.
 
 ## What mono does
 
@@ -10,16 +10,9 @@ A runtime backend for Conductor. Manages execution environments for workspaces.
 - Injects environment variables (MONO\_\*)
 - Tracks state in SQLite
 
-## What mono does NOT do
 
-- Manage git worktrees (Conductor does this)
-- Provide a web UI
-- Orchestrate Claude instances
-- Handle multi-project state
+## Usage
 
-## Global CLI
-
-mono is callable from anywhere. All commands take absolute paths as arguments - no dependency on current working directory.
 
 ```bash
 # Works from any directory
@@ -49,42 +42,6 @@ All operations are logged to `~/.mono/mono.log` with timestamps and environment 
 [14:32:09.012] [+3.889s] [auth-feature] created tmux session mono-auth-feature
 ```
 
-**Streaming output with custom io.Writer:**
-
-```go
-type LogWriter struct {
-    logger  *FileLogger
-    envName string
-    stream  string  // "out" or "err"
-}
-
-func (w *LogWriter) Write(p []byte) (n int, err error) {
-    lines := strings.Split(string(p), "\n")
-    for _, line := range lines {
-        if line != "" {
-            w.logger.Log("[%s|%s] %s", w.envName, w.stream, line)
-        }
-    }
-    return len(p), nil
-}
-```
-
-**Usage:**
-
-```go
-run.Command("docker", "compose", "up", "-d").
-    Dir(workDir).
-    Stdout(&LogWriter{logger: log, envName: envName, stream: "out"}).
-    Stderr(&LogWriter{logger: log, envName: envName, stream: "err"}).
-    Run()
-```
-
-**All command output is streamed and logged in real-time:**
-
-- init/setup/destroy scripts
-- docker compose up/down
-- tmux commands
-
 Useful for debugging - `tail -f ~/.mono/mono.log` shows live progress, grep by env name to filter.
 
 ---
@@ -96,9 +53,9 @@ mono init <path>       Register environment, start containers, create tmux
 mono destroy <path>    Stop containers, kill tmux, clean data
 mono run <path>        Execute run script in tmux
 mono list              List all environments
+mono cache stats       Shows statistics for internal cache maintained by mono
+mono cache clean -all  Cleans up the entire cache, too free up space.
 ```
-
-Four commands. No more.
 
 ---
 
@@ -119,37 +76,6 @@ CREATE TABLE environments (
 
 One table. Ports are calculated deterministically from `env_id`, not stored.
 
-### Naming Derivation
-
-Names are derived from the workspace path for human readability:
-
-```
-/Users/x/frontend/.conductor/workspaces/feature-auth
-         ↑                              ↑
-      project                       workspace
-         └──────────────────────────────┘
-              "frontend-feature-auth"
-```
-
-```go
-func deriveNames(path string) (project, workspace string) {
-    parts := strings.Split(path, "/")
-    for i, part := range parts {
-        if part == ".conductor" && i > 0 {
-            project = parts[i-1]
-        }
-        if part == "workspaces" && i < len(parts)-1 {
-            workspace = parts[i+1]
-        }
-    }
-    return project, workspace
-}
-```
-
-| Purpose                           | Source                              |
-| --------------------------------- | ----------------------------------- |
-| Port allocation                   | `env_id` (from SQLite)              |
-| Naming (tmux, docker, data, logs) | `<project>-<workspace>` (from path) |
 
 ### Directory Structure
 
@@ -170,14 +96,16 @@ func deriveNames(path string) (project, workspace string) {
 Located in workspace root. Optional.
 
 ```yaml
+env:
+  MONO_HOME: "${MONO_DATA_DIR}"
+
 scripts:
   init: "npm install" # runs BEFORE docker starts
   setup: "npm run db:migrate" # runs AFTER docker is ready
-  run: "npm run dev"
+  run: "go run ./cmd/mono list"
   destroy: "npm run cleanup"
-```
 
-Four scripts. No more.
+```
 
 ### Environment Detection
 
@@ -315,9 +243,9 @@ Deterministic from `env_id` - no storage needed.
 ```json
 {
   "scripts": {
-    "setup": "mono init \"$CONDUCTOR_WORKSPACE_PATH\"",
-    "run": "mono run \"$CONDUCTOR_WORKSPACE_PATH\"",
-    "archive": "mono destroy \"$CONDUCTOR_WORKSPACE_PATH\""
+    "setup": "mono init",
+    "run": "mono run",
+    "archive": "mono destroy"
   }
 }
 ```
@@ -387,73 +315,8 @@ Two packages: `cli` (5 files), `mono` (10 files).
 
 ---
 
-## Dependencies
-
-```
-github.com/spf13/cobra           CLI framework
-modernc.org/sqlite               SQLite (CGO-free)
-github.com/compose-spec/compose-go/v2   Docker Compose parsing
-gopkg.in/yaml.v3                 YAML parsing
-```
-
 ---
 
-## Scope Boundaries
-
-### Will NOT add
-
-- Web UI
-- WebSocket/real-time features
-- Git operations
-- Project-level abstractions
-- Additional script hooks beyond init/run/destroy
-- Custom tmux window management
-- Shared services between environments
-
-### May add later (only if needed)
-
-- `mono attach <path>` - attach to tmux session
-- `mono logs <path>` - view container logs
-- `mono exec <path> <cmd>` - run command in container
-
----
-
-## Implementation Order
-
-1. SQLite state management (state/)
-2. Port allocation (ports/)
-3. Docker lifecycle (docker/)
-4. Tmux session management (tmux/)
-5. Environment variables (env/)
-6. Config parsing (config/)
-7. Operations layer (operations/)
-8. CLI commands (cli/)
-
----
-
-## Error Handling
-
-All errors are returned, never swallowed.
-
-```go
-func Init(path string) error {
-    if _, err := os.Stat(path); err != nil {
-        return fmt.Errorf("path does not exist: %s", path)
-    }
-
-    exists, err := state.EnvironmentExists(path)
-    if err != nil {
-        return fmt.Errorf("failed to check environment: %w", err)
-    }
-    if exists {
-        return fmt.Errorf("environment already exists: %s", path)
-    }
-
-    // ...
-}
-```
-
----
 
 ## Success Criteria
 
@@ -467,246 +330,3 @@ mono is complete when:
 6. Conductor integration works via scripts
 
 ---
-
-## Code Reuse from Piko
-
-### Source Location
-
-Piko codebase: `/Users/gwuah/Desktop/piko`
-
-### Mapping Table
-
-| mono file             | piko source                     | reuse         | modifications                      |
-| --------------------- | ------------------------------- | ------------- | ---------------------------------- |
-| `mono/cmd.go`         | `internal/run/cmd.go`           | Copy directly | None                               |
-| `mono/ports.go`       | `internal/ports/allocator.go`   | Copy directly | Update base port constant          |
-| `mono/db.go`          | `internal/state/db.go`          | Adapt         | New schema, ~/.mono/state.db       |
-| `mono/environment.go` | `internal/state/environment.go` | Adapt         | Remove Project concept             |
-| `mono/docker.go`      | `internal/docker/*.go`          | Adapt         | Keep override logic, rename prefix |
-| `mono/tmux.go`        | `internal/tmux/session.go`      | Adapt         | Remove piko naming, simplify       |
-| `mono/env.go`         | `internal/env/vars.go`          | Adapt         | PIKO* → MONO* prefix               |
-| `mono/config.go`      | `internal/config/piko.go`       | Adapt         | .piko.yml → mono.yml               |
-| `mono/logger.go`      | `internal/logger/logger.go`     | Adapt         | Add LogWriter, ~/.mono/mono.log    |
-| `mono/operations.go`  | `internal/operations/*.go`      | Adapt         | Init(), Destroy(), Run()           |
-
----
-
-### Package Details
-
-All files below are in `internal/mono/` package.
-
-#### cmd.go (Copy as-is)
-
-**Source:** `piko/internal/run/cmd.go`
-
-```go
-Command(name string, args ...string) *Cmd
-Cmd.Dir(dir string) *Cmd
-Cmd.Timeout(d time.Duration) *Cmd
-Cmd.Stdout(w io.Writer) *Cmd
-Cmd.Stderr(w io.Writer) *Cmd
-Cmd.Run() error
-```
-
-No changes needed. Use `Stdout()` / `Stderr()` with `LogWriter` for streaming.
-
----
-
-#### ports.go (Copy, minor edits)
-
-**Source:** `piko/internal/ports/allocator.go`
-
-```go
-Allocation struct { Service, ContainerPort, HostPort }
-Allocate(envID int64, servicePorts map[string][]uint32) []Allocation
-```
-
-**Changes:** Update `BasePort` from 10000 → 19000
-
----
-
-#### db.go + environment.go (Adapt)
-
-**Source:** `piko/internal/state/db.go`, `environment.go`
-
-**db.go:**
-
-```go
-Open() (*DB, error)  // opens ~/.mono/state.db
-Initialize() error   // creates schema
-```
-
-**environment.go:**
-
-```go
-InsertEnvironment(path, dockerProject string) (int64, error)
-GetEnvironmentByPath(path string) (*Environment, error)
-ListEnvironments() ([]*Environment, error)
-DeleteEnvironment(path string) error
-```
-
-**Schema:**
-
-```sql
-CREATE TABLE environments (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    path TEXT UNIQUE NOT NULL,
-    docker_project TEXT,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
-
----
-
-#### docker.go (Adapt)
-
-**Source:** `piko/internal/docker/compose.go`, `override.go`
-
-```go
-CheckDockerAvailable() error
-DetectComposeFile(dir string) (string, error)
-ParseComposeConfig(workDir string) (*ComposeConfig, error)
-GetServicePorts() map[string][]uint32
-ApplyOverrides(project, envName string, allocations []Allocation)
-StartContainers(projectName, workDir string) error
-StopContainers(projectName string) error
-```
-
-**Keep ApplyOverrides()** - essential for isolation (ports, networks, volumes).
-
-**Changes:** Rename prefix `piko-<project>-<env>` → `mono-<project>-<workspace>`
-
----
-
-#### tmux.go (Adapt)
-
-**Source:** `piko/internal/tmux/session.go`
-
-```go
-SessionExists(name string) (bool, error)
-CreateSession(name, workDir string) error
-SendKeys(session, keys string) error
-KillSession(name string) error
-```
-
-**Remove:** `ListPikoSessions()`, `CreateFullSession()`, window management
-
-**Naming:** Sessions are `mono-<project>-<workspace>`
-
----
-
-#### env.go (Adapt)
-
-**Source:** `piko/internal/env/vars.go`
-
-```go
-func DeriveNames(path string) (project, workspace string)
-
-type MonoEnv struct {
-    Project   string
-    Workspace string
-    EnvID     int64
-    EnvPath   string
-    DataDir   string
-    Ports     map[string]int
-}
-
-func (e *MonoEnv) ToEnvSlice() []string
-func (e *MonoEnv) FullName() string  // returns "<project>-<workspace>"
-```
-
-**Changes:** `PIKO_*` → `MONO_*`, add `DeriveNames()`, add `FullName()`
-
----
-
-#### config.go (Adapt)
-
-**Source:** `piko/internal/config/piko.go`
-
-```go
-type Config struct {
-    Scripts Scripts `yaml:"scripts"`
-}
-
-type Scripts struct {
-    Init    string `yaml:"init"`
-    Setup   string `yaml:"setup"`
-    Run     string `yaml:"run"`
-    Destroy string `yaml:"destroy"`
-}
-
-func Load(dir string) (*Config, error)
-```
-
-**Remove:** `Shells`, `Shared`, `Ignore`
-
----
-
-#### logger.go (Adapt)
-
-**Source:** `piko/internal/logger/logger.go`
-
-```go
-type FileLogger struct { ... }
-func NewFileLogger(path string) (*FileLogger, error)
-func (l *FileLogger) Log(format string, args ...any)
-func (l *FileLogger) Close()
-
-type LogWriter struct {
-    logger  *FileLogger
-    envName string
-    stream  string  // "out" or "err"
-}
-func (w *LogWriter) Write(p []byte) (n int, err error)
-```
-
-**Changes:** Log to `~/.mono/mono.log`, add `LogWriter`
-
----
-
-#### operations.go (New)
-
-**Source:** `piko/internal/operations/*.go`
-
-```go
-func Init(path string, logger *FileLogger) error
-func Destroy(path string, logger *FileLogger) error
-func Run(path string, logger *FileLogger) error
-```
-
-Orchestrates all other components.
-
----
-
-### Dependency Versions (from piko go.mod)
-
-```go
-require (
-    github.com/spf13/cobra v1.9.1
-    github.com/compose-spec/compose-go/v2 v2.4.7
-    gopkg.in/yaml.v3 v3.0.1
-    modernc.org/sqlite v1.42.2
-)
-```
-
----
-
-### Implementation Checklist
-
-```
-[ ] 1. Create mono/ directory structure
-[ ] 2. Initialize go.mod with dependencies
-[ ] 3. Create internal/mono/cmd.go (copy from piko)
-[ ] 4. Create internal/mono/ports.go (update BasePort)
-[ ] 5. Create internal/mono/logger.go (add LogWriter)
-[ ] 6. Create internal/mono/db.go (new schema)
-[ ] 7. Create internal/mono/environment.go
-[ ] 8. Create internal/mono/docker.go (rename prefix)
-[ ] 9. Create internal/mono/tmux.go (simplify)
-[ ] 10. Create internal/mono/env.go (rename prefix, add deriveNames)
-[ ] 11. Create internal/mono/config.go (simplify)
-[ ] 12. Create internal/mono/operations.go
-[ ] 13. Create internal/cli/ (4 commands: init, destroy, run, list)
-[ ] 14. Create cmd/mono/main.go
-[ ] 15. Test with Conductor
-```
