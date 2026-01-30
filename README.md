@@ -2,7 +2,8 @@
 
 mono is a devtool that extends [conductor](https://conductor.build) and allows you to easily spawn parallel dev environments for each conductor workspace.
 
-## Motivation/Philosophy
+<details>
+<summary>Motivation/Philosophy</summary>
 
 coding agents have solved parallel codegen, but the bottlenecks of parallel software development (design, testing, verification, etc) remain largely unsolved. secondly, while coding agents run inference & work on tasks, there's not much to do besides wait. what if you could take advantage and take a stab at another feature?
 
@@ -11,6 +12,8 @@ even though a large majority of apps run **primarily** on web, and any given dev
 most tools fail completely because they ignore the constraints & subjectivity of software engineering, and try to be a magic wand.
 
 mono **is not** a magic wand, but if you're aware of your **constraints**, it can help you build one in **<= 20mins**.
+
+</details>
 
 ## What it doees?
 
