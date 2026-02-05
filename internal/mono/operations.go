@@ -83,6 +83,14 @@ func Init(path string) error {
 
 	rootPath := os.Getenv("CONDUCTOR_ROOT_PATH")
 
+	// Check for cargo build conflicts early, before any seeding/caching
+	if rootPath != "" {
+		if err := CheckCargoBuildConflicts(rootPath); err != nil {
+			logger.Log("warning: %v", err)
+			logger.Log("hint: seeding/caching may be slow or fail due to lock contention")
+		}
+	}
+
 	var cacheEntries []ArtifactCacheEntry
 	if len(cfg.Build.Artifacts) > 0 && rootPath != "" {
 		entries, err := cm.PrepareArtifactCache(cfg.Build.Artifacts, rootPath, path)
@@ -179,6 +187,14 @@ func Init(path string) error {
 	}
 
 	var allocations []Allocation
+
+	// Re-check for cargo build conflicts before init script (may have started during seeding)
+	if rootPath != "" {
+		if err := CheckCargoBuildConflicts(rootPath); err != nil {
+			logger.Log("warning: %v", err)
+			logger.Log("hint: init script may block waiting for file lock")
+		}
+	}
 
 	if cfg.Scripts.Init != "" {
 		scriptEnv := buildScriptEnv(envName, envID, path, rootPath, allocations, cfg.Env, cacheEnvVars)

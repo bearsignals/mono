@@ -144,6 +144,62 @@ func TestHardlinkTree(t *testing.T) {
 	}
 }
 
+func TestHardlinkTreePreservesSymlinks(t *testing.T) {
+	src := t.TempDir()
+	dst := filepath.Join(t.TempDir(), "dst")
+
+	// Create a real file and a symlink to it
+	realDir := filepath.Join(src, "pkg", "bin")
+	if err := os.MkdirAll(realDir, 0755); err != nil {
+		t.Fatalf("failed to create dir: %v", err)
+	}
+	realFile := filepath.Join(realDir, "tool")
+	if err := os.WriteFile(realFile, []byte("#!/bin/bash\necho tool"), 0755); err != nil {
+		t.Fatalf("failed to write file: %v", err)
+	}
+
+	binDir := filepath.Join(src, ".bin")
+	if err := os.MkdirAll(binDir, 0755); err != nil {
+		t.Fatalf("failed to create .bin: %v", err)
+	}
+	symlink := filepath.Join(binDir, "tool")
+	if err := os.Symlink("../pkg/bin/tool", symlink); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	if err := HardlinkTree(src, dst); err != nil {
+		t.Fatalf("HardlinkTree failed: %v", err)
+	}
+
+	// Check that the symlink is preserved
+	dstSymlink := filepath.Join(dst, ".bin", "tool")
+	info, err := os.Lstat(dstSymlink)
+	if err != nil {
+		t.Fatalf("failed to lstat destination symlink: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Errorf(".bin/tool should be a symlink, got mode %v", info.Mode())
+	}
+
+	target, err := os.Readlink(dstSymlink)
+	if err != nil {
+		t.Fatalf("failed to read symlink: %v", err)
+	}
+	if target != "../pkg/bin/tool" {
+		t.Errorf("symlink target should be '../pkg/bin/tool', got '%s'", target)
+	}
+
+	// Check that the real file is hardlinked
+	dstReal := filepath.Join(dst, "pkg", "bin", "tool")
+	realInfo, err := os.Lstat(dstReal)
+	if err != nil {
+		t.Fatalf("failed to lstat destination file: %v", err)
+	}
+	if realInfo.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("pkg/bin/tool should be a regular file, not a symlink")
+	}
+}
+
 func TestHardlinkTreeReplaceBreaksLink(t *testing.T) {
 	src := t.TempDir()
 	dst := filepath.Join(t.TempDir(), "dst")
@@ -1491,6 +1547,78 @@ func TestCountFiles(t *testing.T) {
 
 	if countAll != 5 {
 		t.Errorf("expected 5 files with no skip, got %d", countAll)
+	}
+}
+
+func TestSeedDirectoryPreservesSymlinks(t *testing.T) {
+	testDir := t.TempDir()
+	srcDir := filepath.Join(testDir, "src")
+	dstDir := filepath.Join(testDir, "dst")
+
+	// Create source structure like node_modules/.bin
+	if err := os.MkdirAll(filepath.Join(srcDir, ".bin"), 0755); err != nil {
+		t.Fatalf("failed to create .bin dir: %v", err)
+	}
+	if err := os.MkdirAll(filepath.Join(srcDir, "esbuild", "bin"), 0755); err != nil {
+		t.Fatalf("failed to create esbuild dir: %v", err)
+	}
+
+	// Create a real file
+	realFile := filepath.Join(srcDir, "esbuild", "bin", "esbuild")
+	if err := os.WriteFile(realFile, []byte("#!/bin/bash\necho esbuild"), 0755); err != nil {
+		t.Fatalf("failed to write esbuild: %v", err)
+	}
+
+	// Create a symlink in .bin pointing to the real file (relative path like npm does)
+	symlink := filepath.Join(srcDir, ".bin", "esbuild")
+	if err := os.Symlink("../esbuild/bin/esbuild", symlink); err != nil {
+		t.Fatalf("failed to create symlink: %v", err)
+	}
+
+	// Verify the symlink was created correctly
+	srcInfo, err := os.Lstat(symlink)
+	if err != nil {
+		t.Fatalf("failed to lstat source symlink: %v", err)
+	}
+	if srcInfo.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("source .bin/esbuild is not a symlink")
+	}
+
+	// Seed the directory
+	err = SeedDirectory(srcDir, dstDir, SeedOptions{
+		ArtifactName: "npm",
+	})
+	if err != nil {
+		t.Fatalf("SeedDirectory failed: %v", err)
+	}
+
+	// Verify the destination symlink is still a symlink
+	dstSymlink := filepath.Join(dstDir, ".bin", "esbuild")
+	dstInfo, err := os.Lstat(dstSymlink)
+	if err != nil {
+		t.Fatalf("failed to lstat destination symlink: %v", err)
+	}
+	if dstInfo.Mode()&os.ModeSymlink == 0 {
+		t.Errorf("destination .bin/esbuild should be a symlink, but it's not (mode: %v)", dstInfo.Mode())
+	}
+
+	// Verify the symlink target is correct
+	target, err := os.Readlink(dstSymlink)
+	if err != nil {
+		t.Fatalf("failed to read symlink target: %v", err)
+	}
+	if target != "../esbuild/bin/esbuild" {
+		t.Errorf("symlink target should be '../esbuild/bin/esbuild', got '%s'", target)
+	}
+
+	// Verify the real file was hardlinked (not the symlink target)
+	dstRealFile := filepath.Join(dstDir, "esbuild", "bin", "esbuild")
+	dstRealInfo, err := os.Lstat(dstRealFile)
+	if err != nil {
+		t.Fatalf("failed to lstat destination real file: %v", err)
+	}
+	if dstRealInfo.Mode()&os.ModeSymlink != 0 {
+		t.Errorf("destination esbuild/bin/esbuild should be a regular file, not a symlink")
 	}
 }
 
