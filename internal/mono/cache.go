@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -177,6 +178,21 @@ func HardlinkTree(src, dst string) error {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
 
+		// Check if it's a symlink - recreate as symlink instead of hardlinking target
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("failed to read symlink %s: %w", path, err)
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				if os.IsExist(err) {
+					return nil
+				}
+				return fmt.Errorf("failed to create symlink %s: %w", dstPath, err)
+			}
+			return nil
+		}
+
 		if err := os.Link(path, dstPath); err != nil {
 			if os.IsExist(err) {
 				return nil
@@ -222,10 +238,12 @@ func shouldSkipCargoPath(relPath string) bool {
 }
 
 type SeedOptions struct {
-	ArtifactName  string
-	Logger        *FileLogger
-	NumWorkers    int
-	OperationName string
+	ArtifactName    string
+	Logger          *FileLogger
+	NumWorkers      int
+	OperationName   string
+	ProgressTimeout time.Duration // Abort if no progress for this duration (0 = 30s default)
+	FileTimeout     time.Duration // Timeout for individual file operations (0 = 10s default)
 }
 
 func copyDirectory(src, dst, artifactName string, logger *FileLogger, operation string) error {
@@ -258,16 +276,26 @@ func countFiles(src string, artifactName string) (int64, error) {
 }
 
 type fileEntry struct {
-	srcPath  string
-	dstPath  string
-	relPath  string
-	mode     fs.FileMode
+	srcPath string
+	dstPath string
+	relPath string
+	mode    fs.FileMode
 }
 
 func SeedDirectory(src, dst string, opts SeedOptions) error {
 	numWorkers := opts.NumWorkers
 	if numWorkers <= 0 {
-		numWorkers = 16
+		numWorkers = 16 // Reduced from 16 to avoid APFS contention
+	}
+
+	progressTimeout := opts.ProgressTimeout
+	if progressTimeout <= 0 {
+		progressTimeout = 30 * time.Second
+	}
+
+	fileTimeout := opts.FileTimeout
+	if fileTimeout <= 0 {
+		fileTimeout = 10 * time.Second
 	}
 
 	var totalFiles int64
@@ -326,10 +354,10 @@ func SeedDirectory(src, dst string, opts SeedOptions) error {
 		}
 
 		files = append(files, fileEntry{
-			srcPath:  path,
-			dstPath:  filepath.Join(dst, relPath),
-			relPath:  relPath,
-			mode:     info.Mode(),
+			srcPath: path,
+			dstPath: filepath.Join(dst, relPath),
+			relPath: relPath,
+			mode:    info.Mode(),
 		})
 
 		return nil
@@ -350,7 +378,34 @@ func SeedDirectory(src, dst string, opts SeedOptions) error {
 	}
 	close(fileChan)
 
-	g, ctx := errgroup.WithContext(context.Background())
+	// Track progress for timeout detection
+	var lastProgress atomic.Int64
+	lastProgress.Store(time.Now().UnixNano())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Watchdog goroutine: cancel if no progress within timeout
+	watchdogDone := make(chan struct{})
+	go func() {
+		defer close(watchdogDone)
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				lastTime := time.Unix(0, lastProgress.Load())
+				if time.Since(lastTime) > progressTimeout {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	g, gctx := errgroup.WithContext(ctx)
 
 	var once sync.Once
 	var firstErr error
@@ -359,19 +414,22 @@ func SeedDirectory(src, dst string, opts SeedOptions) error {
 		g.Go(func() error {
 			for {
 				select {
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-gctx.Done():
+					return gctx.Err()
 				case f, ok := <-fileChan:
 					if !ok {
 						return nil
 					}
 
-					if err := linkOrCopyFile(f.srcPath, f.dstPath); err != nil {
+					if err := linkOrCopyFileWithTimeout(f.srcPath, f.dstPath, fileTimeout); err != nil {
 						once.Do(func() {
 							firstErr = fmt.Errorf("failed to link %s: %w", f.relPath, err)
 						})
 						return firstErr
 					}
+
+					// Update progress timestamp
+					lastProgress.Store(time.Now().UnixNano())
 
 					if progress != nil {
 						progress.Increment()
@@ -381,7 +439,14 @@ func SeedDirectory(src, dst string, opts SeedOptions) error {
 		})
 	}
 
-	if err := g.Wait(); err != nil {
+	err = g.Wait()
+	cancel() // Stop watchdog
+	<-watchdogDone
+
+	if err != nil {
+		if err == context.Canceled {
+			return fmt.Errorf("seeding timed out: no progress for %v", progressTimeout)
+		}
 		return err
 	}
 
@@ -393,6 +458,28 @@ func SeedDirectory(src, dst string, opts SeedOptions) error {
 }
 
 func linkOrCopyFile(src, dst string) error {
+	// Check if source is a symlink - we need to recreate symlinks, not hardlink their targets
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+
+	if srcInfo.Mode()&os.ModeSymlink != 0 {
+		// It's a symlink - read the target and recreate it
+		target, err := os.Readlink(src)
+		if err != nil {
+			return fmt.Errorf("failed to read symlink %s: %w", src, err)
+		}
+		if err := os.Symlink(target, dst); err != nil {
+			if os.IsExist(err) {
+				return nil
+			}
+			return fmt.Errorf("failed to create symlink %s: %w", dst, err)
+		}
+		return nil
+	}
+
+	// Regular file - hardlink it
 	if err := os.Link(src, dst); err != nil {
 		if os.IsExist(err) {
 			return nil
@@ -403,6 +490,23 @@ func linkOrCopyFile(src, dst string) error {
 		return err
 	}
 	return nil
+}
+
+// linkOrCopyFileWithTimeout wraps linkOrCopyFile with a timeout.
+// If the operation doesn't complete within the timeout, it returns an error.
+// Note: the underlying goroutine may still be blocked, but we move on.
+func linkOrCopyFileWithTimeout(src, dst string, timeout time.Duration) error {
+	done := make(chan error, 1)
+	go func() {
+		done <- linkOrCopyFile(src, dst)
+	}()
+
+	select {
+	case err := <-done:
+		return err
+	case <-time.After(timeout):
+		return fmt.Errorf("operation timed out after %v", timeout)
+	}
 }
 
 func copyFile(src, dst string) error {
@@ -663,6 +767,85 @@ func (cm *CacheManager) isBuildInProgress(envPath string, artifact ArtifactConfi
 	}
 }
 
+// CargoProcessInfo contains information about a running cargo process
+type CargoProcessInfo struct {
+	PID     string
+	Command string
+}
+
+// DetectRunningCargoProcesses checks if any cargo/rustc processes are running
+// that reference the given project path. Returns a list of matching processes.
+func DetectRunningCargoProcesses(projectPath string) ([]CargoProcessInfo, error) {
+	// Use ps to get all cargo and rustc processes with their full command lines
+	cmd := exec.Command("ps", "-eo", "pid,command")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to run ps: %w", err)
+	}
+
+	var processes []CargoProcessInfo
+	lines := strings.Split(string(output), "\n")
+
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		// Check if this is a cargo or rustc process
+		if !strings.Contains(line, "cargo") && !strings.Contains(line, "rustc") {
+			continue
+		}
+
+		// Check if it references our project path
+		if !strings.Contains(line, projectPath) {
+			continue
+		}
+
+		// Parse PID (first field)
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+
+		processes = append(processes, CargoProcessInfo{
+			PID:     fields[0],
+			Command: strings.Join(fields[1:], " "),
+		})
+	}
+
+	return processes, nil
+}
+
+// CheckCargoBuildConflicts checks for any conditions that would cause cargo build
+// to block: either a .cargo-lock file or running cargo/rustc processes.
+// Returns a descriptive error if a conflict is found, nil otherwise.
+func CheckCargoBuildConflicts(projectPath string) error {
+	// Check for .cargo-lock file
+	lockFile := filepath.Join(projectPath, "target", ".cargo-lock")
+	if fileExists(lockFile) {
+		return fmt.Errorf("cargo lock file exists at %s - another cargo process may be running", lockFile)
+	}
+
+	// Check for running cargo/rustc processes
+	processes, err := DetectRunningCargoProcesses(projectPath)
+	if err != nil {
+		// Don't fail on detection errors, just log and continue
+		return nil
+	}
+
+	if len(processes) > 0 {
+		var pids []string
+		for _, p := range processes {
+			pids = append(pids, p.PID)
+		}
+		return fmt.Errorf("found %d running cargo/rustc process(es) for %s (PIDs: %s)",
+			len(processes), projectPath, strings.Join(pids, ", "))
+	}
+
+	return nil
+}
+
 func (cm *CacheManager) syncArtifact(artifact ArtifactConfig, rootPath, envPath string, opts SyncOptions) error {
 	if cm.isBuildInProgress(envPath, artifact) {
 		return fmt.Errorf("build in progress, cannot sync %s", artifact.Name)
@@ -771,6 +954,21 @@ func copyDir(src, dst string) error {
 			return os.MkdirAll(dstPath, info.Mode())
 		}
 
+		// Check if it's a symlink - recreate as symlink instead of copying target
+		if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return fmt.Errorf("failed to read symlink %s: %w", path, err)
+			}
+			if err := os.Symlink(target, dstPath); err != nil {
+				if os.IsExist(err) {
+					return nil
+				}
+				return fmt.Errorf("failed to create symlink %s: %w", dstPath, err)
+			}
+			return nil
+		}
+
 		return copyFile(path, dstPath)
 	})
 }
@@ -837,10 +1035,15 @@ func (cm *CacheManager) seedToCache(sourcePath, cachePath, artifactName string, 
 		return nil
 	}
 
-	return SeedDirectory(sourcePath, targetInCache, SeedOptions{
+	err := SeedDirectory(sourcePath, targetInCache, SeedOptions{
 		ArtifactName: artifactName,
 		Logger:       logger,
 	})
+	if err != nil {
+		os.RemoveAll(targetInCache)
+		return err
+	}
+	return nil
 }
 
 type CacheSizeEntry struct {
