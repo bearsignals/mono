@@ -231,7 +231,7 @@ func Init(path string) error {
 		}
 
 		servicePorts := composeConfig.GetServicePorts()
-		allocations = Allocate(envID, servicePorts)
+		allocations = Allocate(envName, servicePorts)
 
 		composeProject := composeConfig.Project()
 		ApplyOverrides(composeProject, envName, allocations)

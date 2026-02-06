@@ -1,10 +1,15 @@
 package mono
 
-import "fmt"
+import (
+	"fmt"
+	"hash/fnv"
+)
 
 const (
 	BasePort             = 19000
-	PortRangePerWorktree = 100
+	PortRangePerWorktree = 10
+	MaxPort              = 65535
+	MaxPortSlots         = (MaxPort - BasePort) / PortRangePerWorktree
 )
 
 type Allocation struct {
@@ -13,8 +18,11 @@ type Allocation struct {
 	HostPort      int
 }
 
-func Allocate(envID int64, servicePorts map[string][]int) []Allocation {
-	basePort := BasePort + (int(envID) * PortRangePerWorktree)
+func Allocate(envName string, servicePorts map[string][]int) []Allocation {
+	h := fnv.New32a()
+	h.Write([]byte(envName))
+	slot := int(h.Sum32()) % MaxPortSlots
+	basePort := BasePort + (slot * PortRangePerWorktree)
 
 	var allocations []Allocation
 	usedPorts := make(map[int]bool)
@@ -22,7 +30,7 @@ func Allocate(envID int64, servicePorts map[string][]int) []Allocation {
 
 	for service, ports := range servicePorts {
 		for _, containerPort := range ports {
-			hostPort := basePort + (containerPort % 100)
+			hostPort := basePort + (containerPort % PortRangePerWorktree)
 			for usedPorts[hostPort] {
 				hostPort = basePort + portIndex
 				portIndex++
