@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-func Init(path string) error {
+func Init(path string, projectRoot string) error {
 	if _, err := os.Stat(path); err != nil {
 		return fmt.Errorf("path does not exist: %s", path)
 	}
@@ -81,7 +81,10 @@ func Init(path string) error {
 		logger.Log("hint: install sccache for faster builds: cargo install sccache")
 	}
 
-	rootPath := os.Getenv("CONDUCTOR_ROOT_PATH")
+	rootPath := projectRoot
+	if rootPath == "" {
+		rootPath = os.Getenv("CONDUCTOR_ROOT_PATH")
+	}
 
 	// Check for cargo build conflicts early, before any seeding/caching
 	if rootPath != "" {
