@@ -9,6 +9,8 @@ import (
 )
 
 func NewInitCmd() *cobra.Command {
+	var projectRoot string
+
 	cmd := &cobra.Command{
 		Use:   "init [path]",
 		Short: "Initialize a new environment",
@@ -24,9 +26,11 @@ func NewInitCmd() *cobra.Command {
 				return fmt.Errorf("path does not exist: %s", absPath)
 			}
 
-			return mono.Init(absPath)
+			return mono.Init(absPath, projectRoot)
 		},
 	}
+
+	cmd.Flags().StringVar(&projectRoot, "project", "", "root path of the project (falls back to CONDUCTOR_ROOT_PATH)")
 
 	return cmd
 }
